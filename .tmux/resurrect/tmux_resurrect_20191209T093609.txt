@@ -1,0 +1,5 @@
+pane	trenton	0	:bash	0	:-	0	:/home/tylerpri/trenton/prod/unittests/debug/build	1	bash	:
+pane	trenton	2	:vim	1	:*M	0	:/home/tylerpri/trenton	1	vim	:vim -b .gitignore
+window	trenton	0	0	:-	b35e,211x61,0,0,1
+window	trenton	2	1	:*M	b362,211x61,0,0,5
+state	trenton	

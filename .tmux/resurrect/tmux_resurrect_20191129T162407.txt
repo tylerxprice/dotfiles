@@ -1,0 +1,7 @@
+pane	0	0	:bash	0	:-	0	:/home/tylerpri	1	bash	:
+pane	0	1	:panes	1	:*	0	:/home/tylerpri	1	bash	:
+pane	0	1	:panes	1	:*	1	:/home/tylerpri	0	bash	:
+pane	0	1	:panes	1	:*	2	:/home/tylerpri	0	bash	:
+window	0	0	0	:-	b35d,211x61,0,0,0
+window	0	1	1	:*	f198,211x61,0,0[211x47,0,0,2,211x13,0,48{72x13,0,48,1,138x13,73,48,4}]
+state	0	
