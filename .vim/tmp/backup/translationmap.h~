@@ -1,0 +1,166 @@
+/*
+ * INTEL CONFIDENTIAL
+ *
+ * Copyright 2014-2018 Intel Corporation All Rights Reserved.
+ *
+ * The source code contained or described herein and all documents related to
+ * the source code ("Material") are owned by Intel Corporation or its
+ * suppliers or licensors. Title to the Material remains with Intel
+ * Corporation or its suppliers and licensors. The Material contains trade
+ * secrets and proprietary and confidential information of Intel or its
+ * suppliers and licensors. The Material is protected by worldwide copyright
+ * and trade secret laws and treaty provisions. No part of the Material may be
+ * used, copied, reproduced, modified, published, uploaded, posted,
+ * transmitted, distributed, or disclosed in any way without Intel's prior
+ * express written permission.
+ *
+ * No license under any patent, copyright, trade secret or other intellectual
+ * property right is granted to or conferred upon you by disclosure or
+ * delivery of the Materials, either expressly, by implication, inducement,
+ * estoppel or otherwise. Any license under such intellectual property rights
+ * must be express and approved by Intel in writing.
+ *
+ ******************************************************************************/
+#include "sol/sol.h"
+#include "hal_substrate.h"
+
+SOL_TRACEPATTERN(("all", "hal", "mmutable", 0));
+
+//--------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------
+        /*
+         * To bring up DRAM sans-MMU, the DRAM is mapped to two ranges
+         *
+             * 0x00_1000_0000 - 0x00_FFFF_FFFF
+         * 0x10_1000_0000 - 0x18_0FFF_FFFF
+         *
+         * The two ranges Alias, hence... 0x00_1000_0000 == 0x10_1000_0000, however one range is larger, if you wish to access DRAM ranges outside of 3.75G you must use the 0x10_1000_0000 - 0x18_0FFF_FFFF range
+         * if you wish to read addresses outside of the 4G range and bypass the MMU+CPU you can issue the command "target rr axi[Peripheral view Adress]"
+         * for GD we have the following Perihperal view mapping - 0x90_1000_0000 - 0x98_0FFF_FFFF aliases to physical values 0x10_1000_0000 - 0x18_0FFF_FFFF. It is marked as resevered in the Memory Map - but this is a documentation bug...
+         * to read the first byte of DRAM issue the command "target rr axi[0x9010000000]" which will read physical address (0x00_1000_0000 == 0x10_1000_0000). Same spot in Memory can also be accessed with the command
+         * "target rr axi[0x8010000000]"
+         *
+         * however to access memory above 3.75G one must use the 0x90_1000_0000 - 0x98_0FFF_FFFF range
+         *
+         * to access the first the first byte of memory that we could not access without MMU swapping issue the command 
+         *
+         * enabling the flag ENABLE_DMT_MULTI_ADDRESS_MODE will jump to using the larger range.
+         *   
+         * for an 8G of memory we will have the following mapping
+         *
+         *    virtualAddressStart,virtualAddressEnd,physicalAddressStart isValid executable writeAccess shareable global longMemoryType
+         *    
+         *    {0x10000000,0x7fffffff,0x1015c00000,0x1,0x0,0x1,0x2    (SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE),0x1,{0x5,0x5 (LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE),0x5}}     -> table[0] (ttbr0)
+         *    {0x80000000,0xffffffff,0x1080000000,0x1,0x0,0x1,0x2    (SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE),0x0,{0x5,0x5 (LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE),0x5}}     -> table[0] (ttbr1)
+         *    
+         *    {0x80000000,0xffffffff,0x1100000000,0x1,0x0,0x1,0x2    (SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE),0x0,{0x5,0x5 (LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE),0x5}}     -> table[1] (ttbr1)  
+         *    {0x80000000,0xffffffff,0x1180000000,0x1,0x0,0x1,0x2    (SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE),0x0,{0x5,0x5 (LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE),0x5}}     -> table[2] (ttbr1)
+         *    {0x80000000,0x8fffffff,0x1200000000,0x1,0x0,0x1,0x2    (SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE),0x0,{0x5,0x5 (LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE),0x5}}     -> table[3] (ttbr1)
+         *    
+         * Since we are in ARMv7 LPAE mode - we can only have a 32Bit virtual address, we basically need to switch MMU tables using HalCpu_SwitchAddressSpace(mmuTable)
+         * so phsyicall addresses in the range of (0x15c00000 to 0xFFFFFFF) (3.75G) can be accssed using just table 0, but to go above that we need ot switch addressses
+         *
+         * At any one time our MMU will be using two translation tables if we enable LPAE format, for access above 2G we will use the Variable window - below we will always use the range that points to (0x10800000,0x7fffffff)
+         *
+         */        
+
+
+#define NUM_OF_MMU_REGIONS 17
+const static TranslationMap_t translationMap[NUM_OF_MMU_REGIONS] =
+{
+    //  romRegion          
+     { 0x00000000, 0x0001FFFF, 0x00000000,   MMU_ATTR_VALID,   MMU_ATTR_EXECUTABLE,     MMU_ATTR_READ_ONLY,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+    //  sramRegion         
+     { 0x00020000, 0x0003FFFF, 0x00020000,   MMU_ATTR_VALID,   MMU_ATTR_EXECUTABLE,     MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+    //  nplRegion          
+     { 0x02000000, 0x03FFFFFF, 0x02000000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  nscCpuifRegion     
+     { 0x04000000, 0x05FFFFFF, 0x04000000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  stmCpuConfigRegion 
+     { 0x0A000000, 0x0AFFFFFF, 0x0A000000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_READ_ONLY,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  resRegRegion       
+     { 0x0B102000, 0x0BFF7FFF, 0x0B102000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  ddrctrlI2cRegion   
+     { 0x0C000000, 0x0C17FFFF, 0x0C000000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  xdmac0Region       
+     { 0x0C188000, 0x0C18BFFF, 0x0C188000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  xdmac1Region       
+     { 0x0C18C000, 0x0C18FFFF, 0x0C18C000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  gicCpuRegion       
+     { 0x0C1C0000, 0x0C1FFFFF, 0x0C1C0000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  gic500Region       
+     { 0x0C200000, 0x0C27FFFF, 0x0C200000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+    //  sysCtrsRegion      
+     { 0x0C2C0000, 0x0C2C0FFF, 0x0C2C0000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_DEVICE },
+
+
+#if (CF == CF_SENTINELROCK) && TEMPORARY_8TB_GD_WORKAROUND
+    //  nsShareRegion      
+     { 0x10000000, 0x101FFFFF, 0x1010000000,   MMU_ATTR_VALID,   MMU_ATTR_EXECUTABLE,     MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+ #if ENABLE_HARNESS || ENABLE_FIXTURE
+    //  globalShareRegion  
+     { 0x10200000, 0x107FFFFF, 0x1010200000,   MMU_ATTR_VALID,   MMU_ATTR_EXECUTABLE,     MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+ #else //ENABLE_HARNESS || ENABLE_FIXTURE
+    //  globalShareRegion  
+     { 0x10200000, 0x107FFFFF, 0x1010200000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+ #endif //ENABLE_HARNESS || ENABLE_FIXTURE
+        /*
+         * Data DRAM attributes directly relate to ARM ACP ARUSER/AWUSER field setup for proper IDMA transfer.
+         * If you're changing its attributes, please make sure the relevant ACP fields in DMT block are changed
+         * accordingly, otherwise, IDMA will not work with ACP enabled.
+        */
+    //  privateCpu0Dram    
+     { 0x10800000, 0x130FFFFF, 0x1010800000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+
+    //  sharedBankRegion   
+     { 0x15A00000, 0x15BFFFFF, 0x1015A00000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+
+#else //CF == CF_SENTINELROCK && TEMPORARY_8TB_GD_WORKAROUND
+    //  nsShareRegion      
+     { 0x10000000, 0x101FFFFF, 0x10000000,   MMU_ATTR_VALID,   MMU_ATTR_EXECUTABLE,     MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+ #if ENABLE_HARNESS || ENABLE_FIXTURE
+    //  globalShareRegion  
+     { 0x10200000, 0x107FFFFF, 0x10200000,   MMU_ATTR_VALID,   MMU_ATTR_EXECUTABLE,     MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+ #else //ENABLE_HARNESS || ENABLE_FIXTURE
+    //  globalShareRegion  
+     { 0x10200000, 0x107FFFFF, 0x10200000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+ #endif //ENABLE_HARNESS || ENABLE_FIXTURE
+        /*
+         * Data DRAM attributes directly relate to ARM ACP ARUSER/AWUSER field setup for proper IDMA transfer.
+         * If you're changing its attributes, please make sure the relevant ACP fields in DMT block are changed
+         * accordingly, otherwise, IDMA will not work with ACP enabled.
+        */
+    //  privateCpu0Dram    
+     { 0x10800000, 0x130FFFFF, 0x10800000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+
+    //  sharedBankRegion   
+     { 0x15A00000, 0x15BFFFFF, 0x15A00000,   MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+#endif //CF == CF_SENTINELROCK && TEMPORARY_8TB_GD_WORKAROUND
+
+    //  l2pRegion          
+     { 0x15C00000, 0xFFFFFFFF, 0x1015C00000, MMU_ATTR_VALID,   MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_WRITEABLE,  SHAREABLE_ATTRIBUTE_OUTER_SHAREABLE,  MMU_ATTR_GLOBAL,     LONG_MEMORY_TYPE_NORMAL_WRITE_BACK_RW_ALLOC_CACHEABLE },
+
+    //  endMarker 
+     { END_OF_TABLE_MARKER, 0xFFFFFFFF, 0xFFFFFFFF,   MMU_ATTR_INVALID, MMU_ATTR_NOT_EXECUTABLE, MMU_ATTR_READ_ONLY, SHAREABLE_ATTRIBUTE_NON_SHAREABLE,     MMU_ATTR_NOT_GLOBAL, LONG_MEMORY_TYPE_DEVICE },
+
+};
+
+// Index of the non-shared DRAM region from the tables above.
+static const uint32_t NON_SHARED_DRAM_REGION_INDEX = 13;
+static const uint32_t BANK_SHARED_DRAM_REGION_INDEX = 14;
+static const uint32_t L2P_DRAM_REGION_INDEX = 15;
+
+// See fixedMap for Shared DRAM  Size
+static const uint32_t SHARED_DRAM_REGION_SIZE_MB = 8;
+
+// Stack the start of core1 right up against the end of core0
+static const uint32_t MMUTABLE_CORE_ALIGNMENT_OFFSET_TYPE = MMUTABLE_CORE_ALIGNMENT_OFFSET_STACKED_WITH_OFFSET;
+
+// To make DRAM layout symetrical for both cores, so that for 2, 4, 6 and 8G DRAM SKUs, 1G block of physical DRAM address for core-1 can be 1G aligned in Long-descriptor translation table.
+static const  uint32_t CORE1_ALIGNMENT_OFFSET = SHARED_DRAM_REGION_SIZE_MB * 1024 * 1024;
+
+// Constant structure to hold working copy of TranslationMap array.
+// Make sure to size for the largest TranslationMap_t[]
+TranslationMap_t translationMapCopy[PROCESSOR_NUM][NUM_OF_MMU_REGIONS];
+

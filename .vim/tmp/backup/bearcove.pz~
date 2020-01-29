@@ -1,0 +1,187 @@
+"""
+Brief:
+    bearcove.py - Contains Bear Cove Device class definition
+
+Description: -
+
+Class(es):
+    Enter GetHeaders("bearcove") to display Class listings.
+
+Function(s):
+    None
+
+Related: -
+
+Author(s):
+    Emma Fletcher
+"""
+
+from sunsetcove_plus import *
+
+from util import alias
+
+class BearCove(SunsetCovePlus):
+    """
+    Brief:
+        BearCove() - Bear Cove class contains Carmel Ridge specific methods.
+
+    Description:
+        This class extends Sunset Cove Plus.
+
+    Class(es):
+        None
+
+    Method(s):
+        Enter GetHeaders("bearcove","BearCove") to display Method listings.
+
+    Related: -
+
+    Author(s):
+        Emma Fletcher
+    """
+
+    def __init__(self, devicePath=None, readBuf=None, writeBuf=None, flags=0, deviceIndex=None, scan=None ):
+        """
+        Brief:
+            __init__(devicePath=None, readBuf=None, writeBuf=None, flags=0, deviceIndex=None,
+            scan=None ) - BearCove constructor
+
+        Description: -
+
+        Argument(s):
+            devicePath - (Optional; Defaults to None) The device path of a drive. If None, then a
+                scan and prompt will be issued for the user to select a device.
+            readBuf - (Optional; Defaults to None) Read buffer you want to use for this device. Will
+                create its own 1MB buffer if None is given.
+            writeBuf - (Optional; Defaults to None) write buffer you want to use for this device.
+                Will create its own 1MB buffer if None is given.
+            flags - (Optional; Defaults to 0) Flags used to determine TWIDL behavior with the
+                device. See device.py for definition.
+            deviceIndex - (Optional; Defaults to None) Scan index of the DUT. Alternative to
+                devicePath.
+            scan - (Optional; Defaults to None) Scan object to use for device selection.
+
+        Return Value(s):
+            BearCove Object
+
+        Example: -
+
+        Related: -
+
+        Author(s):
+            Emma Fletcher
+        """
+        containMethods(self, NLBAGenericCmd(self))
+        containMethods(self, NLBACmd(self))
+        containMethods(self, NLBAOtherCmd(self))  
+        if self.getCmdSet() == "UART":
+            containMethods(self, NLBAGenericUARTCmd(self))   
+
+        SunsetCovePlus.__init__(self, devicePath, readBuf, writeBuf, flags=flags, deviceIndex=deviceIndex, scan=scan )
+
+        # add aliases to the device object
+        alias.defineAliasesForDevice(self)
+
+    def _getProduct(self):
+        """
+        Brief:
+            _getProduct() - Return the string "BearCove"
+
+        Description:
+            Overloads the function in Device.
+
+        Argument(s):
+            None
+
+        Return Value(s):
+            "BearCove" as a String
+
+        Example: -
+
+        Related: -
+
+        Author(s):
+            Emma Fletcher
+        """
+
+        return "BearCove"
+
+    def _getSerialCode(self, serial):
+        """
+        Brief:
+            _getSerialCode(serial) - Return the correct capacity code for preping the drive.
+                1600GB drives are currently not supported!
+
+        Description:
+            Prep for BC relies on different binaries depending on which SKU your drive is.
+            Those files differ by a 'Serial Code' or Capacity code.
+
+        Argument(s):
+            serial - (Required) Based of the serial number it will determine what the code is.
+
+        Return Value(s):
+            String type. "70", "71", "72", "73", "74", "75", "76", "77", "7C", or "" if there was an error.
+
+        Example:
+            -
+
+        Related:
+            -
+
+        Author(s):
+            Adam McGinnis
+        """
+        serialCode = ""
+        serial = self.getIdent().getSerial()
+        
+        if serial.startswith('ZG'):
+            serialCode = "70"
+        elif serial.startswith('ZP'):
+            serialCode = "71"
+        elif serial.startswith('ZQ'):
+            serialCode = "72"
+        elif serial.startswith('ZR'):
+            serialCode = "73"
+        elif serial.startswith('ZS'):
+            serialCode = "7D"
+        elif serial.startswith('ZH'):
+            serialCode = "74"
+        elif serial.startswith('ZL'):
+            serialCode = "75"
+        elif serial.startswith('ZM'):
+            serialCode = "76"
+        elif serial.startswith('ZN'):
+            serialCode = "77"
+        elif serial.startswith('ZJ'):
+            serialCode = "79"
+        elif serial.startswith('ZK'):
+            serialCode = "7A"
+        elif serial.startswith('Z7'):
+            serialCode = "7B"
+        elif serial.startswith('Z9'):
+            serialCode = "7E"
+            
+        return serialCode
+
+# -----------------------------------Testing code--------------------------------------
+if __name__ == '__main__':
+
+    import sys
+    from device import *
+
+    if ( 2 != len(sys.argv) ):
+        print "You forgot to specify device! "
+        print "Usage example: python -i device.py \\\\.\\PhysicalDrive1\n"
+        sys.argv.append( scan(select=True) )
+        if ( not sys.argv[1] ):
+            quit()
+
+    rp1 = BearCove(sys.argv[1])
+    rbuf, wbuf = rp1.getReadBuffer(), rp1.getWriteBuffer()
+
+    publishMethods([rp1, rp1.getIdent()])
+
+    # make command aliases global
+    from util import alias
+    alias.defineAliases(globals())
+

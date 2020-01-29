@@ -1,0 +1,1165 @@
+///
+/// @file sentinelrockplus.ld
+///
+/// @brief Linker directives file
+///
+/// @cond
+/// Copyright 2016-2018 Intel Corporation All Rights Reserved. The source code
+/// contained or described herein and all documents related to the source code
+/// ("Material") are owned by Intel Corporation or its suppliers or licensors.
+/// Title to the Material remains with Intel Corporation or its suppliers and
+/// licensors. The Material contains trade secrets and proprietary and
+/// confidential information of Intel or its suppliers and licensors. The
+/// Material is protected by worldwide copyright and trade secret laws and
+/// treaty provisions. No part of the Material may be used, copied, reproduced,
+/// modified, published, uploaded, posted, transmitted, distributed, or
+/// disclosed in any way without Intel's prior express written permission.
+///
+/// No license under any patent, copyright, trade secret or other intellectual
+/// property right is granted to or conferred upon you by disclosure or delivery
+/// of the Materials, either expressly, by implication, inducement, estoppel or
+/// otherwise. Any license under such intellectual property rights must be
+/// express and approved by Intel in writing.
+/// @endcond
+
+/// Sentinel Rock Virtual to Physical Memory mapping for multi-core support
+/// --------------------------------------------------------------------
+///
+
+#include "Product.h" // Should be the first include file.
+
+
+#if (CF != CF_SENTINELROCKPLUS)
+    #error source file compiled from incorrect directory
+#endif // (CF != CF_SENTINELROCKPLUS)
+
+//
+// Program layout for running out of RAM.
+//
+#define BSS_UNCACHED_LAYOUT .
+#define BOOT_RAM_EXTENSION_LENGTH 0
+
+CONSTANTS
+{
+    SRAM_SIZE                       = 63K
+    CODE_SIZE                       = 768K
+    TEXT_SIZE                       = 1024K
+
+#if HALTEST_BUILD
+    // C++ data initialization happens behind the scene in main(), 
+    // which uses stack rather than heap; increasing the stack size 
+    // to prevent stack overflow, accounting for new SolTestFixture.
+    STACK_RESERVE                   = 4K
+
+    /// @todo Remove ALT_STACK_RESERVE once proper quad core MMU mapping is in place
+    ALT_STACK_RESERVE               = 8K   // arbitrarily chosen
+#else  // HALTEST_BUILD
+    STACK_RESERVE                   = 1K
+#endif // HALTEST_BUILD
+
+    //-----------------------------------------------------------------------
+    //  Source: Sentinel Rock Plus Chip Architecture Specification
+    //-----------------------------------------------------------------------
+    ADDRESSABLE_MEMORY_SIZE         = 4096M;
+
+    PERIPHBASE                      = 0x0C1C0000;
+    CS_TIMER                        = 0x0C380000;
+
+    NTP_PER_UNIT_SIZE               = 4K;
+    NPS_PER_UNIT_SIZE               = 4K;
+    NUM_OF_MAILBOXES                = 13;
+    DESC_SRAM_BYTESIZE_PER_CORE     = 9216;
+    TBUF_SRAM_CACHE0_BASE           = 0x04800000;
+    TBUF_SRAM_CACHE1_BASE           = 0x05000000;
+
+    DRAM_BASE                       = 0x10000000;
+
+    PROGRAM_DRAM_BASE               = DRAM_BASE;
+    PROGRAM_DRAM_SIZE               = 2M;    // 0x200000
+
+    PAGE_TABLE_DRAM_BASE            = PROGRAM_DRAM_BASE + PROGRAM_DRAM_SIZE;  // 0x10000000 + 0x200000 = 0x10200000
+    PAGE_TABLE_DRAM_SIZE            = 512K;  // 0x80000
+
+#if (ENABLE_HARNESS || ENABLE_FIXTURE)
+    COMMS_BASE                      = PAGE_TABLE_DRAM_BASE + PAGE_TABLE_DRAM_SIZE
+    COMMS_SIZE                      = 32K
+
+    FIXTURE_BASE                    = COMMS_BASE + COMMS_SIZE
+    FIXTURE_SIZE                    = 1M
+
+    SHARED_DRAM_BASE                = FIXTURE_BASE + FIXTURE_SIZE; // Shifted and shrunk for COMMS and Fixture, !ENABLE_NORTH_SOUTH_MULTICORE
+    SHARED_DRAM_SIZE                = 6M - PAGE_TABLE_DRAM_SIZE - COMMS_SIZE - FIXTURE_SIZE;
+
+    DATA_DRAM_BASE                  = SHARED_DRAM_BASE + SHARED_DRAM_SIZE;
+    DATA_DRAM_SIZE                  = 79M // Shunken for PlatformTestBuffer
+
+    PLATFORMTESTBUFFER_BASE         = DATA_DRAM_BASE + DATA_DRAM_SIZE
+    PLATFORMTESTBUFFER_SIZE         = 5M
+#else // (ENABLE_HARNESS || ENABLE_FIXTURE)
+    SHARED_DRAM_BASE                = PAGE_TABLE_DRAM_BASE + PAGE_TABLE_DRAM_SIZE ; /* Zone where two CPU cores share data, 0x10280000 */
+    SHARED_DRAM_SIZE                = 6M - PAGE_TABLE_DRAM_SIZE;  // 0x600000 - 0x80000 = 0x580000
+    DATA_DRAM_BASE                  = SHARED_DRAM_BASE + SHARED_DRAM_SIZE;  // 0x10280000 + 0x580000 = 0x10800000
+
+#if ENABLE_NORTH_SOUTH_MULTICORE
+    DATA_DRAM_SIZE                  = 34M
+    SHARED_BANK_DRAM_SIZE           = 2M
+#else // ENABLE_NORTH_SOUTH_MULTICORE
+    DATA_DRAM_SIZE                  = 84M                // From https://ifcollaborate.intel.com/IFC/getdoc.aspx?docbase=InfoFactoryKB&chronid=09005ffd812cdd25&ver=CURRENT&qepop=false
+#endif // ENABLE_NORTH_SOUTH_MULTICORE
+#endif // (ENABLE_HARNESS || ENABLE_FIXTURE)
+    L2P_DRAM_BASE                   = DRAM_L2P_REGION_START // 0x12A00000 or 0x15C00000, L2P_DRAM_BASE=DATA_DRAM_BASE+DATA_DRAM_SIZE=(0x12A00000 or 0x15C00000), has to match with DRAM_L2P_REGION_START defined in Product.h
+
+    // portion of DATA_DRAM that needs to be initialized before loading MFW
+    DATA_DRAM_PRELOAD_SIZE          = 2M;
+
+#if HAL_PLATFORM_VEP
+    L2P_DRAM_SIZE                   = 256M       // VEP maps traffic gen registers in the upper 2G address space
+#else // HAL_PLATFORM_VEP
+    L2P_DRAM_SIZE                   = 3736M      // L2P takes the rest of the DRAM from the DRAM_L2P_REGION_START.
+#endif // HAL_PLATFORM_VEP
+
+#if HAL_PLATFORM_VEP
+    // We can store the main FW image from VP here since the bootloader doesn't clear this memory region on startup.
+    MAINFW_PRELOAD_BUFFER_BASE      = DRAM_L2P_REGION_START;
+#endif // HAL_PLATFORM_VEP
+
+    //@todo : Check if GHS_GUARD is still needed
+    //--------------------------------
+    // Scratch Ram Organization
+    // -------------------------------
+    // ENTRY section
+    // 1344 bytes
+    // -------------------------------
+    // SLAVE_HOLDS
+    // 128 bytes
+    //--------------------------------
+    // Scratch RAM code and data
+    // 4K
+    // -------------------------------
+    // SRAM SPI FConfig stream and buffers
+    // 6K
+    // -------------------------------
+    // Boot info
+    // 4K
+    // -------------------------------
+    // GHS_GUARD
+    // 64 bytes
+    // -------------------------------
+    // Data on Scratch RAM
+    // Variable
+    // -------------------------------
+    // ROM profiling (FIPS POST + ROM boot profiling)
+    // 36 bytes
+    // -------------------------------
+    // ROM FORWARD
+    // 12 bytes
+    // -------------------------------
+    // ROM MONITOR STACK
+    // 512 bytes
+    // -------------------------------
+
+    GHS_GUARD_SIZE              = 64 /* Buffer at the end of scratch ram to stop green hills from having memory errors */
+    SLAVE_HOLDS_SIZE            = 128 /* Common area between bootloader and PFW. */
+    ENTRY_SECTION_SIZE          = 2048
+    BIS_SIZE                    = 2K;
+    TABLE_BUILDER_INFO_SIZE     = 1K; /* [24B]sizeof (TableParams_t) * [16]NUM_TABLES + [20] (Other Info) * [2]MUM_CORES */
+
+#if defined(SOL_UNIT_TEST) || ENABLE_PLATFORM_TEST
+    HEAP_SIZE                   = 256K
+    TEST_COMMAND_SIZE           = 128
+#else //defined(SOL_UNIT_TEST) || ENABLE_PLATFORM_TEST
+    HEAP_SIZE                   = 0
+    TEST_COMMAND_SIZE           = 0
+#endif //defined(SOL_UNIT_TEST) || ENABLE_PLATFORM_TEST
+
+    ROM_FIPS_POST_PROF_SIZE     = 16
+    ROM_PROFILE_SIZE            = 20
+    ROM_FORWARD_SIZE            = 12 // Reserved for holding pen, interrupt forwarding and core 1 bootloader entry address.
+    BOOTPROFILE_SIZE            = 4K
+    ROM_MONITOR_STACK_SIZE      = 512
+    SCRATCH_RAM_BASE            = 0x00020000
+    ENTRY_SECTION_BASE          = SCRATCH_RAM_BASE
+    SLAVE_HOLDS_BASE            = ENTRY_SECTION_BASE + ENTRY_SECTION_SIZE
+    SCRATCH_RAM_CODE_BASE       = SLAVE_HOLDS_BASE + SLAVE_HOLDS_SIZE
+    SCRATCH_RAM_PHYSICAL_SIZE   = 128K   // Physical Scratch RAM Size
+    SCRATCH_RAM_FCONFIG_SIZE    = 6K     // SPI FConfig buffer in Scratch RAM - DO NOT CHANGE!!!
+    SCRATCH_RAM_CODE_SIZE       = 4K     // Size of code and data in Scratch RAM
+    SCRATCH_RAM_BSS_SIZE        = SCRATCH_RAM_PHYSICAL_SIZE - (ENTRY_SECTION_SIZE + SCRATCH_RAM_CODE_SIZE + SLAVE_HOLDS_SIZE + SCRATCH_RAM_FCONFIG_SIZE + BIS_SIZE + BOOTPROFILE_SIZE + GHS_GUARD_SIZE + ROM_PROFILE_SIZE + ROM_FIPS_POST_PROF_SIZE + ROM_FORWARD_SIZE + ROM_MONITOR_STACK_SIZE);
+
+    SCRATCH_RAM_FCONFIG_BASE    = SCRATCH_RAM_CODE_BASE + SCRATCH_RAM_CODE_SIZE
+    BOOT_INFO_BASE              = SCRATCH_RAM_FCONFIG_BASE + SCRATCH_RAM_FCONFIG_SIZE;
+    BOOT_INFO_SIZE              = BIS_SIZE;
+    BOOTPROFILE_BASE            = BOOT_INFO_BASE + BOOT_INFO_SIZE;
+    GHS_GUARD_BASE              = BOOTPROFILE_BASE + BOOTPROFILE_SIZE;
+    SCRATCH_RAM_BSS_BASE        = GHS_GUARD_BASE + GHS_GUARD_SIZE;
+
+    ROM_MONITOR_STACK_BASE      = SCRATCH_RAM_BASE + SCRATCH_RAM_PHYSICAL_SIZE - ROM_MONITOR_STACK_SIZE;
+    ROM_FORWARD_BASE            = SCRATCH_RAM_BASE + SCRATCH_RAM_PHYSICAL_SIZE - ROM_MONITOR_STACK_SIZE - ROM_FORWARD_SIZE;
+    ROM_PROFILE_BASE            = SCRATCH_RAM_BASE + SCRATCH_RAM_PHYSICAL_SIZE - ROM_MONITOR_STACK_SIZE - ROM_FORWARD_SIZE - ROM_PROFILE_SIZE;
+    ROM_FIPS_POST_PROF_BASE     = SCRATCH_RAM_BASE + SCRATCH_RAM_PHYSICAL_SIZE - ROM_MONITOR_STACK_SIZE - ROM_FORWARD_SIZE - ROM_PROFILE_SIZE - ROM_FIPS_POST_PROF_SIZE;
+
+#if defined(SOL_UNIT_TEST)
+    TEST_CMD_BUFFER_SIZE        = 0;
+    TEST_CMD_DIRECT_BUFFER_SIZE = 0;
+#else
+    TEST_CMD_BUFFER_SIZE        = 256 * 512;  // 256 sectors is the max non-direct test command size
+    TEST_CMD_DIRECT_BUFFER_SIZE = 0x1000 * 512;
+#endif
+
+#if ENABLE_PLATFORM_TEST
+    PLATFORM_TEST_BUFFER_SIZE   = 0x410100;
+#else  // ENABLE_PLATFORM_TEST
+    PLATFORM_TEST_BUFFER_SIZE   = 0;
+#endif // ENABLE_PLATFORM_TEST
+
+    ICACHE_ALIGNMENT            = 64
+    ICACHE_SIZE                 = 64K
+    IDMA_ALIGNMENT              = 64 // 64B is a DMT forced alignment requirement to align to the cache line.
+
+#if (INTERNAL_SECTOR_SIZE_IN_BYTES == 512)
+    SECTOR_ALIGNMENT            = 512
+#else
+    #error Need to adjust SECTOR_ALIGNMENT
+#endif
+
+#if !ENABLE_DM_IN_11ECC
+ #if ENABLE_DM_PAGE_RETIRE && !ENABLE_EB_REVECTOR
+    DEFECT_MAP_SIZE           = 30M;
+ #elif !ENABLE_DM_PAGE_RETIRE && ENABLE_EB_REVECTOR
+    DEFECT_MAP_SIZE           = 3M;
+ #elif ENABLE_DM_PAGE_RETIRE && ENABLE_EB_REVECTOR
+    DEFECT_MAP_SIZE           = 33M;
+ #else // ENABLE_DM_PAGE_RETIRE && !ENABLE_EB_REVECTOR
+    DEFECT_MAP_SIZE           = 700K;
+ #endif // ENABLE_DM_PAGE_RETIRE && !ENABLE_EB_REVECTOR
+#else // !ENABLE_DM_IN_11ECC
+    DEFECT_MAP_SIZE           = 0K;             //no dm section, use dramu to store defectmap
+#endif //  !ENABLE_DM_IN_11ECC
+
+#if HAL_PLATFORM_VEP
+    // VEP has only 250MB of dram and with the math below, we just need about 4096K in the VEP
+    JOURNAL_SIZE                = 4096K;
+#else // HAL_PLATFORM_VEP
+ #if ENABLE_STREAMING_BANDJOURNAL
+     // 20 * 64K * 2 = 2560K per code
+     //For Streaming Band Journals: 16 host write streams + 2 defrag write streams + 2 defrag read streams
+     //each instance is 2 * native write size (QP)
+     JOURNAL_SIZE                = 2560K;
+ #else // ENABLE_STREAMING_BANDJOURNAL
+     // 254 * 16K * 5 = 20320K (5 Non-Streaming Open Band Journals that supports band sizes of upto 254 slots with 16K Pages)
+     JOURNAL_SIZE                = 20320K;
+ #endif // ENABLE_STREAMING_BANDJOURNAL
+#endif // HAL_PLATFORM_VEP
+    CONGLOMERATE_BUFFER_SIZE    = 3060K;
+    PMIC_SIZE                   = 512;
+    NANDTRIMS_SIZE              = 1K;
+
+    GPIO_SIZE                   = 4K;
+    MBOX_SIZE                   = 256;
+
+    NORTH_SLOW_CTX_SIZE         = 121K;
+    BAND_DM_FAST_SIZE           = 1409K;
+    FAST_DNLD_HDR_SIZE          = 64;
+    FAST_DNLD_REGION_SIZE       = BAND_DM_FAST_SIZE + NORTH_SLOW_CTX_SIZE + FAST_DNLD_HDR_SIZE;
+
+    // ROM MMU maps VA 0x20000000 to PA 0x10000000
+    DRAM_VIRTUAL_ADDRESS_OFFSET = 0x10000000;
+
+    //FPGA-specific for PHYC and test chip configuration
+    FEM_I2C                             = 0x0BE00000 + 0x10000;
+    FEM_MDIO                            = 0x0BE00000 + 0x11000;
+    FEM_I2C_1                           = 0x0BF00000 + 0x10000;
+    FEM_MDIO_1                          = 0x0BF00000 + 0x11000;
+}
+
+
+#define MAP_REGION(name) name : ORIGIN=name##_BASE, LENGTH=name##_SIZE
+
+MEMORY
+{
+    // SCRATCH RAM
+    MAP_REGION(ENTRY_SECTION)
+    MAP_REGION(SLAVE_HOLDS)
+    MAP_REGION(SCRATCH_RAM_CODE)
+    MAP_REGION(SCRATCH_RAM_FCONFIG)
+    MAP_REGION(BOOT_INFO)
+    MAP_REGION(BOOTPROFILE)
+    MAP_REGION(GHS_GUARD)
+    MAP_REGION(SCRATCH_RAM_BSS)
+    MAP_REGION(ROM_FIPS_POST_PROF)
+    MAP_REGION(ROM_PROFILE)
+    MAP_REGION(ROM_FORWARD)
+    MAP_REGION(ROM_MONITOR_STACK)
+
+    // REGISTERS
+    // NPL
+    MMIO0                   : ORIGIN = 0x02000000,                             LENGTH = 528K
+    NPL0                    : ORIGIN = 0x02100000,                             LENGTH = 4K
+    NPLEXT0                 : ORIGIN = 0x02101000,                             LENGTH = 4K
+    SQP0                    : ORIGIN = 0x02102000,                             LENGTH = 24K
+    CQP0                    : ORIGIN = 0x02108000,                             LENGTH = 36K
+    RDMA0                   : ORIGIN = 0x02112000,                             LENGTH = 4K
+    WDMA0                   : ORIGIN = 0x02113000,                             LENGTH = 4K
+    NPLMBOX0                : ORIGIN = 0x02114000,                             LENGTH = 16K
+    ICMB0                   : ORIGIN = 0x0211A000,                             LENGTH = 4K
+    VNLT0                   : ORIGIN = 0x0211C000,                             LENGTH = 4K
+    NPLMBOX_SRAM0           : ORIGIN = 0x02120000,                             LENGTH = 24K
+    CDBUF_SRAM0             : ORIGIN = 0x02140000,                             LENGTH = 128K
+    OROM_SRAM0              : ORIGIN = 0x021A0000,                             LENGTH = 64K
+    VBUF_SRAM0              : ORIGIN = 0x021D0000,                             LENGTH = 128K
+    CMB_SRAM0               : ORIGIN = 0x02200000,                             LENGTH = 64K
+    SGLM_SRAM0              : ORIGIN = 0x02310000,                             LENGTH = 128K
+    NPL0_WDRP0              : ORIGIN = 0x02350000,                             LENGTH = 4K
+    NPL0_WDRP1              : ORIGIN = 0x02352000,                             LENGTH = 4K
+    NPL0_RDRP0              : ORIGIN = 0x02354000,                             LENGTH = 4K
+    NPL0_RDRP1              : ORIGIN = 0x02356000,                             LENGTH = 4K
+    SGLM0                   : ORIGIN = 0x02358000,                             LENGTH = 4K
+
+    // NPL1
+    MMIO1                   : ORIGIN = 0x02400000,                             LENGTH = 528K
+    NPL1                    : ORIGIN = 0x02500000,                             LENGTH = 4K
+    NPLEXT1                 : ORIGIN = 0x02501000,                             LENGTH = 4K
+    SQP1                    : ORIGIN = 0x02502000,                             LENGTH = 24K
+    CQP1                    : ORIGIN = 0x02508000,                             LENGTH = 36K
+    RDMA1                   : ORIGIN = 0x02512000,                             LENGTH = 4K
+    WDMA1                   : ORIGIN = 0x02513000,                             LENGTH = 4K
+    NPLMBOX1                : ORIGIN = 0x02514000,                             LENGTH = 16K
+    ICMB1                   : ORIGIN = 0x0251A000,                             LENGTH = 4K
+    VNLT1                   : ORIGIN = 0x0251C000,                             LENGTH = 4K
+    NPLMBOX_SRAM1           : ORIGIN = 0x02520000,                             LENGTH = 24K
+    CDBUF_SRAM1             : ORIGIN = 0x02540000,                             LENGTH = 128K
+    OROM_SRAM1              : ORIGIN = 0x025A0000,                             LENGTH = 64K
+    VBUF_SRAM1              : ORIGIN = 0x025D0000,                             LENGTH = 128K
+    CMB_SRAM1               : ORIGIN = 0x02600000,                             LENGTH = 64K
+    SGLM_SRAM1              : ORIGIN = 0x02710000,                             LENGTH = 128K
+    NPL1_WDRP0              : ORIGIN = 0x02750000,                             LENGTH = 4K
+    NPL1_WDRP1              : ORIGIN = 0x02752000,                             LENGTH = 4K
+    NPL1_RDRP0              : ORIGIN = 0x02754000,                             LENGTH = 4K
+    NPL1_RDRP1              : ORIGIN = 0x02756000,                             LENGTH = 4K
+    SGLM1                   : ORIGIN = 0x02758000,                             LENGTH = 4K
+
+    CPUIF                   : ORIGIN = 0x04000000,                             LENGTH = 4K
+    NMCGRB                  : ORIGIN = 0x04001000,                             LENGTH = 4K
+    TBUF                    : ORIGIN = 0x04002000,                             LENGTH = 4K
+    DLM0                    : ORIGIN = 0x04006000,                             LENGTH = 4K
+    DLM1                    : ORIGIN = 0x04007000,                             LENGTH = 4K
+    INTCTRL                 : ORIGIN = 0x04008000,                             LENGTH = 4K
+    LCOR                    : ORIGIN = 0x0400A000,                             LENGTH = 8K
+    LPAC                    : ORIGIN = 0x04009000,                             LENGTH = 4K
+    XOR                     : ORIGIN = 0x0400C000,                             LENGTH = 16K
+    SOFT_XOR                : ORIGIN = 0x04010000,                             LENGTH = 4K
+    PWG                     : ORIGIN = 0x04011000,                             LENGTH = 4K
+    UART                    : ORIGIN = 0x04012000,                             LENGTH = 4K
+    NTP0                    : ORIGIN = 0x04020000,                             LENGTH = 4K
+    NTP1                    : ORIGIN = 0x04022000,                             LENGTH = 4K
+    NTP2                    : ORIGIN = 0x04024000,                             LENGTH = 4K
+    NTP3                    : ORIGIN = 0x04026000,                             LENGTH = 4K
+    NTP4                    : ORIGIN = 0x04028000,                             LENGTH = 4K
+    NTP5                    : ORIGIN = 0x0402A000,                             LENGTH = 4K
+    NTP6                    : ORIGIN = 0x0402C000,                             LENGTH = 4K
+    NTP7                    : ORIGIN = 0x0402E000,                             LENGTH = 4K
+    NTP8                    : ORIGIN = 0x04030000,                             LENGTH = 4K
+    NTP9                    : ORIGIN = 0x04032000,                             LENGTH = 4K
+    NTP10                   : ORIGIN = 0x04034000,                             LENGTH = 4K
+    NTP11                   : ORIGIN = 0x04036000,                             LENGTH = 4K
+    NTP12                   : ORIGIN = 0x04038000,                             LENGTH = 4K
+    NTP13                   : ORIGIN = 0x0403A000,                             LENGTH = 4K
+    NTP14                   : ORIGIN = 0x0403C000,                             LENGTH = 4K
+    NTP15                   : ORIGIN = 0x0403E000,                             LENGTH = 4K
+    NTL                     : ORIGIN = 0x04049000,                             LENGTH = 96K
+    TLM                     : ORIGIN = 0x042FF000,                             LENGTH = 4K
+    TLL_SRAM                : ORIGIN = 0x04300000,                             LENGTH = 64K
+
+#if HAL_PLATFORM_FEP
+    TBUF0_SRAM              : ORIGIN = 0x04800000,                             LENGTH = 2M
+    TBUF1_SRAM              : ORIGIN = 0x05200000,                             LENGTH = 2M  // TBUF_SRAM_CACHE1_BASE + 2M offset
+#else // HAL_PLATFORM_FEP
+    TBUF0_SRAM              : ORIGIN = 0x04800000,                             LENGTH = 4M
+    TBUF1_SRAM              : ORIGIN = 0x05400000,                             LENGTH = 4M  // TBUF_SRAM_CACHE1_BASE + 4M offset
+#endif // HAL_PLATFORM_FEP
+
+    GPV                     : ORIGIN = 0x0B000000,                             LENGTH = 1M
+    GPIO0_BASE              : ORIGIN = 0x0B102000,                             LENGTH = 4K
+    GPIO1_BASE              : ORIGIN = 0x0B103000,                             LENGTH = 4K
+    GPIO2_BASE              : ORIGIN = 0x0B104000,                             LENGTH = 4K
+    APBLOGGER               : ORIGIN = 0x0B105000,                             LENGTH = 5K
+    // Refer to Sentinel_Rock_Plus PSS Integration Note for register memory map of PSS_PORT0, PSS_PORT1, PSS_PORT2
+    // PSS port_0 address map: Serdes#0, Serdes#1, Serdes#2, Serdes#3, PSS bifurcation control Registers
+    // PSS port_1 address map: (Port A) PSS Registers, PMU Registers, PIPE Registers, PAL Registers, Link_Common Registers, PCIe Controller
+    // PSS port_2 address map: (Port B) PSS Registers, PMU Registers, PIPE Registers, PAL Registers, Link_Common Registers, PCIe Controller
+    PSS_PORT0               : ORIGIN = 0x0BD00000,                             LENGTH = 1M
+    PSS_PORT1               : ORIGIN = 0x0BE00000,                             LENGTH = 1M
+    PSS_PORT2               : ORIGIN = 0x0BF00000,                             LENGTH = 1M
+    DDRCTLR                 : ORIGIN = 0x0C000000,                             LENGTH = 4K
+    I2C_REGS                : ORIGIN = 0x0C002000,                             LENGTH = 4K
+    SPI                     : ORIGIN = 0x0C004000,                             LENGTH = 4K
+    SYSCTRL                 : ORIGIN = 0x0C006000,                             LENGTH = 4K
+    SOCIPCTRL               : ORIGIN = 0x0C007000,                             LENGTH = 4K
+    OTP                     : ORIGIN = 0x0C010000,                             LENGTH = 4K
+#if HAL_PLATFORM_VEP
+    VEP                     : ORIGIN = 0x0C011000,                             LENGTH = 4K
+#endif // HAL_PLATFORM_VEP
+    KEYCACHE0               : ORIGIN = 0x0C020000,                             LENGTH = 64K
+    KEYCACHE1               : ORIGIN = 0x0C030000,                             LENGTH = 64K
+    DDRPHY                  : ORIGIN = 0x0C060000,                             LENGTH = 128K
+    DMT0                    : ORIGIN = 0x0C188000,                             LENGTH = 2K
+    DMT0_DBUF               : ORIGIN = 0x0C188800,                             LENGTH = 4K
+    DMT0_TMUX               : ORIGIN = 0x0C189800,                             LENGTH = 6K
+    SCX0                    : ORIGIN = 0x0C18B000,                             LENGTH = 4K
+    DMT1                    : ORIGIN = 0x0C18C000,                             LENGTH = 2K
+    DMT1_DBUF               : ORIGIN = 0x0C18C800,                             LENGTH = 4K
+    DMT1_TMUX               : ORIGIN = 0x0C19D800,                             LENGTH = 6K
+    SCX1                    : ORIGIN = 0x0C18F000,                             LENGTH = 4K
+    GIC500                  : ORIGIN = 0x0C200000,                             LENGTH = 1M
+
+    // DRAM
+    MAP_REGION(PROGRAM_DRAM)
+    MAP_REGION(PAGE_TABLE_DRAM)
+#if (ENABLE_HARNESS || ENABLE_FIXTURE)
+    MAP_REGION(COMMS)
+    MAP_REGION(FIXTURE)
+#endif // (ENABLE_HARNESS || ENABLE_FIXTURE)
+    MAP_REGION(SHARED_DRAM)
+    MAP_REGION(DATA_DRAM)
+#if (ENABLE_HARNESS || ENABLE_FIXTURE)
+    MAP_REGION(PLATFORMTESTBUFFER)
+#endif // (ENABLE_HARNESS || ENABLE_FIXTURE)
+    MAP_REGION(L2P_DRAM)
+}
+
+
+//---------------------------------------------------------------------------
+//  Some of the output must be extracted into the firmware download image.
+//  In particular data for the SRAM, CODE, and DATA portions of the firmware
+//  image. See FWpostProcess.pl script for cross reference.
+//---------------------------------------------------------------------------
+SECTIONS
+{
+    //======================================================================
+    //
+    //                      MAIN FW LAYOUT
+    //
+    //=======================================================================
+
+    //==================== SCRATCH RAM ======================================
+    //  Code and Data in Scratch RAM for BL
+    //=======================================================================
+    .sram                              : {} > ENTRY_SECTION
+    __sram_base = .;                   // Begin bin extract for SRAM chunk...
+    .entry                             : {} > .
+    .cpu_init                          : {} > .
+
+    .slave_holds  ALIGN(16) NOCHECKSUM : {} > SLAVE_HOLDS
+    __slave_hold_array = .;
+    .syscall                           : { libsys.a (ind_dots.o (.text))} > . // GHS - "System Call Emulation"
+    .sram_bss_data                     : {} > SCRATCH_RAM_CODE
+    .sram_bss                          : {} > SCRATCH_RAM_CODE
+    __sram_size = . - __sram_base;     // End bin extract for SRAM chunk...
+    __sram_end = .;
+    __sram_total = SRAM_SIZE;          // Used as a landmark for parsing
+
+    .ghs_guard    ALIGN(16) NOCHECKSUM : {} > GHS_GUARD
+    __ghs_guard_base = .;
+    .factory_config         NOCLEAR  MAX_SIZE (SCRATCH_RAM_FCONFIG_SIZE)  MIN_SIZE (SCRATCH_RAM_FCONFIG_SIZE): {} > SCRATCH_RAM_FCONFIG
+    .boot_info              NOCLEAR  MAX_SIZE (BIS_SIZE)  MIN_SIZE (BIS_SIZE): {} > BOOT_INFO
+    .boot_profile             CLEAR  MAX_SIZE (BOOTPROFILE_SIZE) MIN_SIZE (BOOTPROFILE_SIZE) : {} > BOOTPROFILE
+    __boot_profile_base = .;
+
+    .rom_profile       NOCLEAR MIN_SIZE(20) : {} > ROM_PROFILE
+
+    //======================= CODE RAM ======================================
+    //  Code is actually executable plus read only data
+    //  All CPU cores see same thing :: shared!
+    //=======================================================================
+    .code_base               ALIGN(32) : {} > PROGRAM_DRAM
+    __code_base = .;                   // Begin bin extract for CODE chunk...
+    //.entry                             : {} > .
+
+    .text_performance       ALIGN(ICACHE_ALIGNMENT) NOCLEAR MAX_SIZE(ICACHE_SIZE) : {} > .  // i-cache aligned region for performance code
+    .text_performance_memcpy           : { libstartup.a(ind_mcpy.o(.text)) } > .            // put memcpy in the performance section too
+    .text_performance1                 : {} > .
+    .text_performance2                 : {} > .
+    .text_dram                         : {} > .
+    __text_base = .;                   // Begin bin extract for CODE chunk...
+    .text                              : {} > .
+    __text_size = . - __text_base;     // End bin extraction for CODE chunk...
+    __text_total = TEXT_SIZE;          // Used as a landmark for parsing
+    .text_cpp                          : {} > .
+
+    __rodata_base = .;
+    .rodata                            : {} > .
+    __rodata_dram_base = .;
+    __trap_test_cmd_buffer_base = .;
+    .rodata_dram                       : {} > .
+    __trap_test_cmd_buffer_size = . - __rodata_dram_base;
+    .rodata_cpp                        : {} > .
+    .rodata_end                        : {} > .
+    __rodata_end = .;
+
+    .stack  ALIGN(16) PAD(STACK_RESERVE) : {} > .
+    __init_stack_core0 = .;
+    __init_assert_stack1 = .;   //Extra stack for assert, to avoid using actual stack
+
+    .stack_core1 ALIGN(16) PAD(STACK_RESERVE) : {} > .
+    __init_stack_core1 = .;
+
+#if (PROCESSOR_NUM > 2)
+    .stack_core2 ALIGN(16) PAD(STACK_RESERVE) : {} > .
+    __init_stack_core2 = .;
+
+    .stack_core3 ALIGN(16) PAD(STACK_RESERVE) : {} > .
+    __init_stack_core3 = .;
+#endif // (PROCESSOR_NUM > 2)
+
+    .intercall                         : {} > . // GHS - "mixed-mode... Intercall veneers..when then cannot be prepended to the function they are associated with"
+    .interfunc                         : {} > . // GHS - "helper functions that may be required by mixed-mode applications"
+    .secinfo                           : {} > . // GHS - "contains information about the section layout of programs"
+
+    .code_end                          NOCLEAR : {} > . // Not a true section - used as landmark.
+    __code_size = . - __code_base;     // End bin extraction for CODE chunk...
+    __code_total = CODE_SIZE;          // Used as a landmark for parsing
+
+    //======================= PAGE TABLE DRAM ===============================
+    //  Section for page tables
+    //=======================================================================
+    .page_table     ALIGN(32)    CLEAR : {} > PAGE_TABLE_DRAM
+
+#if (ENABLE_HARNESS)
+    .comms          ALIGN(IDMA_ALIGNMENT) PAD(COMMS_SIZE)   : {} > COMMS
+    .fixture        ALIGN(IDMA_ALIGNMENT) PAD(FIXTURE_SIZE) : {} > FIXTURE
+#endif // (ENABLE_HARNESS)
+
+    //======================= DATA RAM ======================================
+    //  Data is read/write and uniquely mapped so each core gets it's own
+    //  separate space  :: instantiated!
+    //=======================================================================
+    .dump_stack_start ALIGN(IDMA_ALIGNMENT) : {} > DATA_DRAM
+    __dump_stack_base = .; //For assert dump, to get the stack
+    .fiq_stack_zi    ALIGN(16) NOCLEAR : {} > .
+    __fiq_stack_base = .;
+    .irq_stack_zi    ALIGN(16) NOCLEAR : {} > .
+    __irq_stack_base = .;
+    .udf_stack_zi    ALIGN(16) NOCLEAR : {} > .
+    __udf_stack_base = .;
+    .abt_stack_zi    ALIGN(16) NOCLEAR : {} > .
+    __abt_stack_base = .;
+    .svc_stack_zi    ALIGN(16) NOCLEAR : {} > .
+    __svc_stack_base = .;
+    .sys_stack_zi_end ALIGN(16) NOCLEAR : {} > .  // Not a true section - used as landmark.
+    __sys_stack_end  = .; // used by FWupdate for overlay buffer
+    .sys_stack_zi              NOCLEAR : {} > .
+    __sys_stack_base = .;
+    __sys_stack_size = __sys_stack_base - __sys_stack_end; // used by FWupdate for overlay buffer
+    __dump_stack_size = . - __dump_stack_base; //To get the stack size for assert dump.
+
+#if HALTEST_BUILD
+    /// @todo Remove __alt_sys_stack_* once proper quad core MMU mapping is in place
+    __alt_sys_stack_end  = .;
+    .alt_stack ALIGN(16) PAD(ALT_STACK_RESERVE) : {} > .
+    __alt_sys_stack_base = .;
+    __alt_sys_stack_size = __alt_sys_stack_base - __alt_sys_stack_end;
+#endif // HALTEST_BUILD
+
+    .data_base       ALIGN(IDMA_ALIGNMENT)         : {} > .
+    __data_base = .; // Begin bin extraction for initialized DATA chunk...
+    .data_start                        : {} > .
+    .data                              : {} > .
+    .gCmdTable                         : {} > .
+    .data_dram                         : {} > .
+    .data_cpp                          : {} > .
+    .libdata                           : { library(*) (.data)  }
+
+    .data_end                          : {} > .
+    __data_size = . - __data_base; // End bin extraction for DATA chunk...
+
+     .original_vector            NOCLEAR : > .
+     __bss_base = .;
+     __bss_boot_base = .;
+    .bss_boot_start                    : {} > .
+#if (ENABLE_PLATFORM_TEST && PLATFORM_TEST_TBUF_ONLY)
+    .heap_align    ALIGN(IDMA_ALIGNMENT) NOCLEAR : {} > .
+    .heap                         PAD(HEAP_SIZE) : {} > .
+    __platformtestlog_start = .;
+    .platformtestlog ALIGN(IDMA_ALIGNMENT)         PAD(0x10000)                  : {} > .
+    __platformtestlog_end = .;
+#elif HALTEST_BUILD
+    // move heap here so that it's accessible within the first 2MB of TBUF SRAM
+    __heap_base = .;
+    .heap_align    ALIGN(IDMA_ALIGNMENT) NOCLEAR : {} > .
+    .heap                         PAD(HEAP_SIZE) : {} > .
+    __heap_size = . - __heap_base; // End of heap
+#endif // (ENABLE_PLATFORM_TEST && PLATFORM_TEST_TBUF_ONLY)
+    .bss_boot                    NOCLEAR MAX_SIZE(4M): { *(COMMON)
+    #if !HALTEST_BUILD  //Needed bss_boot sections, Skip for APVU
+                                                       "bdr.o(.bss*)"               //Needed pre-SPI FCONFIG read
+                                                       "bis.o(.bss*)"
+                                                       "endurancemgr.o(.bss*)"      //Needed pre-SPI FCONFIG read
+                                                       "Pa_Config.o(.bss*)"
+                                                       "read_prefetch.o(.bss*)"
+                                                       "Stats.o(.bss*)"
+                                                       "TcAssert.o(.bss*)"
+                                                       "Tc_Cmd_PassThroughs.o(.bss*)"
+                                                       "Tc_Init.o(.bss*)"
+                                                       "Tc_PersData.o(.bss*)"
+                                                       "Tc_Pmic_RegisterAccess.o(.bss*)"
+                                                       "Tc_TabularDataConfig.o(.bss*)"
+                                                       "uart_protocol.o(.bss*)"
+                                                       "translite_test_cmd_router.o(.bss*)"
+                                                       "translite_trap_handler.o(.bss*)"
+                                                       "servicelib.o(.bss*)"
+
+    #else // !HALTEST_BUILD
+                                                       // move these into bss_boot to be copied over from TBUF to DRAM
+     #if MEDIABANK_NUM == 1
+                                                       "core.o(.bss_dram*)"
+                                                       "solcommanddispatcher.o(.bss*)"
+                                                       "soltestsummary.o(.bss*)"
+                                                       "hmain.o(.bss*)"
+                                                       "iostream.o(.bss*)"
+                                                       "fixtures.o(.bss*)"
+                                                       "spiflash_testfixture.o(.bss*)"
+     #endif // MEDIABANK_NUM == 1
+    #endif //!HALTEST_BUILD  //Skip for APVU
+
+                                                       "armv7acpuadapter.o(.bss*)"
+                                                       "Assert.o(.bss_dram*)"
+                                                       "chip_family.o(.bss*)"
+                                                       "cortexacpu.o(.bss*)"
+                                                       "cortexa53cpu.o(.bss*)"
+                                                       "*ddr.o(.bss*)"
+                                                       "dramadapter*.o(.bss*)"
+                                                       "dwapbssi*.o(.bss*)"
+                                                       "extendedsense.o(.bss*)"
+                                                       "fep*.o(.bss*)"
+                                                       "gicv3.o(.bss*)"
+                                                       "gpio*.o(.bss*)"
+                                                       "haldram_api*.o(.bss*)"
+                                                       "halcpu_api.o(.bss*)"
+                                                       "halpcie*.o(.bss*)"
+                                                       "init.o(.bss*)"
+                                                       "inteluart.o(.bss*)"
+                                                       "halgpio_api.o(.bss*)"
+                                                       "halinit_mainfw.o(.bss*)"
+                                                       "keystone*.o(.bss*)"
+                                                       "lib*.a(.bss*)"
+                                                       "longtable.o(.bss*)"
+                                                       "mrr_public.o(.bss*)"
+                                                       "nmcgrb100base.o(.bss*)"
+                                                       "power_fconfig.o(.bss*)"
+                                                       "pss*.o(.bss*)"
+                                                       "halspiflash*.o(.bss)"
+                                                       "sysctrl*.o(.bss*)"
+                                                       "System_HAL_Public.o(.bss*)"
+                                                       "tablebuilder*.o(.bss*)"
+                                                       "thermal_throttle.o(.bss*)"
+                                                       "thermal_sensor.o(.bss*)"
+                                                       "*timer*.o(.bss*)"
+                                                       "uart.o(.bss*)"
+                                                       "uart_policy.o(.bss*)"
+                                                       "Util.o(.bss*)" } > .
+    .translite_trap_test_cmd_buffer                    ALIGN(IDMA_ALIGNMENT) : {} > .
+    .sram_trap_test_cmd_buffer                         ALIGN(IDMA_ALIGNMENT) : {} > .
+
+#if (!PLATFORM_TEST)
+    .bss                               NOCLEAR : {} > .  //Smaller region of default bss objects.
+#endif // (!PLATFORM_TEST)
+
+    __dump_bss_size = . -  __bss_base;  // To get the task stack size for assert dump.
+
+    .bss_boot_end                      NOCLEAR : {} > .
+    __bss_boot_size = . - __bss_boot_base; // End of BSS boot
+
+    .=0x10900000;                // A linker error will be generated if .bss_boot_end overflows into this region.
+
+    //-----------------------------------------------------------------------
+    // WARNING: Everything after this point is not accessible so long as the original ROM translation table is being used!
+    //-----------------------------------------------------------------------
+    .bss_dram                    NOCLEAR : {} > .  //Begin at 0x10900000
+    .bss_cpp                     NOCLEAR : {} > .
+    .bss_lib                     NOCLEAR : {} > .
+#if (PLATFORM_TEST)
+    .bss                         NOCLEAR : {} > .  //Large region used by Platform tests, would cause bss_boot overflow.
+#endif // (PLATFORM_TEST)
+    .bss_dram_uncached           NOCLEAR : {} > BSS_UNCACHED_LAYOUT
+
+    __bss_size = . - __bss_base;
+    __bss_dram_base = .;
+    __bss_dram_size = 0;
+
+    .gp_buffer       ALIGN(IDMA_ALIGNMENT) NOCLEAR : {} > .
+
+    ._dump_taskstack_base  ALIGN(IDMA_ALIGNMENT) : {} > .
+    __dump_taskstack_base = .; //For assert dump.
+    .task_stacks                       : {} > .
+     __dump_taskstack_size = . - __dump_taskstack_base;  // To get the task stack size for assert dump.
+
+#if HAL_PLATFORM_VEP
+// @TODO: locate these sections correctly once implemented
+    .ACS_REG                   NOCLEAR : {} > .
+    .tcg_tx_buff ALIGN(32)     NOCLEAR : {} > .
+    .tcg_rx_buff ALIGN(32)     NOCLEAR : {} > .
+    //.fast_dnld_header          CLEAR : {} > .
+#endif // HAL_PLATFORM_VEP
+
+    //======================= BACKWARDS DUMMIES =============================
+    //  These symbol hooks are no longer applicable and are disparaged in FD
+    __idramc_base = .;
+    __idramc_end = .;
+    __idramc_size = . - __idramc_base;
+    __timer_base                       = 0;                   // Vectored Interrupt Controller
+    __timer_size                       = 0;                   // NOTE: SIZE IS USED IN GHS SCRIPT(S)
+    __bci3_base = 0;
+    __bci3_size = 0;
+    __bci4_base = 0;
+    __bci4_size = 0;
+    __uefi_base = 0;
+
+    //=======================================================================
+    //                  FIRMWARE SPECIFIC SPECIAL STRUCTURE MAPPING
+    //=======================================================================
+#if ( !(ENABLE_PLATFORM_TEST && PLATFORM_TEST_TBUF_ONLY) && !HALTEST_BUILD )
+    __heap_base = .;
+    .heap_align    ALIGN(IDMA_ALIGNMENT) NOCLEAR : {} > .
+    .heap                         PAD(HEAP_SIZE) : {} > .
+    __heap_size = . - __heap_base; // End of heap
+#endif // ( !(ENABLE_PLATFORM_TEST && PLATFORM_TEST_TBUF_ONLY) && !HALTEST_BUILD )
+
+#if defined(SOL_UNIT_TEST) && !defined(SOL_HAS_OSTREAM)
+     __testlog_start = .;
+     .testlog ALIGN(IDMA_ALIGNMENT)         PAD(0x1000)                  : {} > .
+     __testlog_end = .;
+    .test_command                                                NOCLEAR : {} > .
+#endif
+
+#if (ENABLE_PLATFORM_TEST && !PLATFORM_TEST_TBUF_ONLY)
+     __platformtestlog_start = .;
+     .platformtestlog ALIGN(IDMA_ALIGNMENT)         PAD(0x10000)                  : {} > .
+     __platformtestlog_end = .;
+#endif // (ENABLE_PLATFORM_TEST && !PLATFORM_TEST_TBUF_ONLY)
+
+#if ENABLE_PLATFORM_TEST || defined(HALTEST_BUILD)
+     __platformtestbuffer_start = .;
+     .platformtestbuffer ALIGN(IDMA_ALIGNMENT)        PAD(PLATFORM_TEST_BUFFER_SIZE)                  : {} > .
+     __platformtestbuffer_size = . - __platformtestbuffer_start;
+#endif //ENABLE_PLATFORM_TEST || defined(HALTEST_BUILD)
+
+#if (ENABLE_DM_IN_11ECC == 0)
+     __DefectMap_base  = .;
+    .DefectMap                          NOCLEAR MAX_SIZE (DEFECT_MAP_SIZE): {} > .
+     __DefectMap_size = . - __DefectMap_base;
+#endif
+
+    .SlowCtxJournal                   NOCLEAR : {} > .
+
+    .ContextBlocking ALIGN(SECTOR_ALIGNMENT*32) NOCLEAR : {} > . // Align to 32 sectors per nand page.
+    __ctx_blocking_save_start = .;
+    .CtxBlockingInfo               NOCLEAR MAX_SIZE (512) MIN_SIZE (512) : {} > .
+    .fast_ctx_BandEraseInfo        NOCLEAR MAX_SIZE (5K)  MIN_SIZE (5K) : {} > .
+    // Round up ctx blocking save to be four 16K nand pages. This is for futureproofing and not currently in use.
+    // Using 60KB as it would fit into 4 nand pages with media formats 30C, 32A, and 32B.
+    .CtxBlockingPagesExpansion     NOCLEAR MAX_SIZE (60K - 5K - 512) MIN_SIZE (60K - 5K - 512)  : {} > .
+    __ctx_blocking_save_end           = .;
+
+    .Journal  ALIGN(IDMA_ALIGNMENT) NOCLEAR MAX_SIZE (JOURNAL_SIZE) MIN_SIZE (JOURNAL_SIZE) : {} > .
+
+    .CtxJrnlDirs ALIGN(IDMA_ALIGNMENT) NOCLEAR MAX_SIZE (128K) MIN_SIZE (128K) : {} > .
+
+    __valid_table_start       = .;
+    .fast_ctx_Band_Inval_cached    NOCLEAR MAX_SIZE (8K)  MIN_SIZE (8K)  : {} > .
+    __valid_table_end       = .;
+
+    .fast_ctx_band_States_cached   NOCLEAR MAX_SIZE (2K)  MIN_SIZE (2K)  : {} > .
+    .fast_ctx_band_SeqInfo_cached  NOCLEAR MAX_SIZE (32K) MIN_SIZE (32K) : {} > .
+#if ENABLE_BAND_QUEUE_AUDIT
+    .fast_ctx_Band_LList_cached    NOCLEAR MAX_SIZE (32K) MIN_SIZE (32K) : {} > .  //Not required to be here... but for the clean shutdown to work, it is required here
+#else  // ENABLE_BAND_QUEUE_AUDIT
+    .fast_ctx_Band_LList_cached    NOCLEAR MAX_SIZE (16K) MIN_SIZE (16K) : {} > .  //Not required to be here... but for the clean shutdown to work, it is required here
+#endif // ENABLE_BAND_QUEUE_AUDIT
+    .ReadDisturb                   NOCLEAR : {} > .
+
+    .ContextNonBlocking ALIGN(SECTOR_ALIGNMENT*32)  NOCLEAR : {} > L2P_DRAM  // Align to 32 sectors per nand page.
+    // Note: in case you need to add ANY more new section in this L2P region, please talk to you PLA!!!!
+    //       ONLY L2P table (both internal and host should be in non-blocking L2P section
+    __ctx_nonblocking_save_start      = .;
+    .internalL2P                   NOCLEAR : {} > .
+    .CtxNonBlockingInfo            NOCLEAR : {} > .
+    __ctx_nonblocking_data_end        = .;           // this is needed to size the non-L2P data for CTX Save
+
+    .L2PReadArray                  NOCLEAR : {} > .
+
+    // Note: Removed L2P_R symbol from linker file as it conflicted with L2P_R symnol defined in Indirection.c.
+        // Othwerwise, compiler/linker was treating these two as separate symbols and generated two different base addresses (4 bytes offset to each other).
+        // Functions within Indirection Lib would get the correct base address. However, external modules linked with "extern" key word would get (base address + 4).
+        // That resulted in L2P data inconsistencies and related failures across all products. Refer to the comments in Indirection.c at L2P_R declaration.
+        // L2P_R consumes rest of DRAM, do not add anything after this point
+
+    //======================= SHARED DATA RAM ===============================
+    //  Generally items with allocation pools and management methods
+    //  All CPU cores see same thing :: shared!
+    //=======================================================================
+    .table_builder_info_start  NOCLEAR : {} > SHARED_DRAM // Gulfdale and subsequent families
+    __table_builder_info_base = .;
+    .table_builder_info        NOCLEAR  MAX_SIZE (TABLE_BUILDER_INFO_SIZE)  MIN_SIZE (TABLE_BUILDER_INFO_SIZE): {} > .
+
+    .pmic_start                NOCLEAR : {} > .
+    __pmic_base = .;
+    .pmic                      NOCLEAR MAX_SIZE (PMIC_SIZE) MIN_SIZE (PMIC_SIZE) : {} > .
+    __pmic_size = . - __pmic_base;
+
+    .nandtrims_start                NOCLEAR : {} > .
+    __nandtrims_base = .;
+    .nandtrims                      NOCLEAR MAX_SIZE (NANDTRIMS_SIZE) MIN_SIZE (NANDTRIMS_SIZE) : {} > .
+    __nandtrims_size = . - __nandtrims_base;
+
+    .fwupd_params              NOCLEAR : {} > .
+    .bss_shared                NOCLEAR : {} > .
+
+    .test_cmd_buffer_base_align ALIGN(IDMA_ALIGNMENT) : {} > .
+    __test_cmd_buffer_base = .;
+    .test_cmd_buffer NOCLEAR MAX_SIZE (TEST_CMD_BUFFER_SIZE) MIN_SIZE (TEST_CMD_BUFFER_SIZE) : {} > .
+    __test_cmd_buffer_size = . - __test_cmd_buffer_base;
+
+    .__test_cmd_direct_buffer_base_align ALIGN(IDMA_ALIGNMENT) : {} > .
+    __test_cmd_direct_buffer_base = .;
+    .test_cmd_direct_buffer NOCLEAR MAX_SIZE (TEST_CMD_DIRECT_BUFFER_SIZE) MIN_SIZE (TEST_CMD_DIRECT_BUFFER_SIZE) : {} > .
+    __test_cmd_direct_buffer_size = . - __test_cmd_direct_buffer_base;
+
+    __shared_gpbuffer_base = .;
+    .shared_gpbuffer ALIGN(IDMA_ALIGNMENT) NOCLEAR : {} > .
+
+    //-----------------------------------------------------------------------
+    // Transport-to-Core0/1 mailboxes and descriptor pools: allocated in Shared DRAM
+    //-----------------------------------------------------------------------
+    .dump_mailboxes_descriptor_start = .;
+    __dump_mailboxes_descriptor_base = .; ////For assert dump, to get the Mailboxes.
+    .mailbox_core_ram                  NOCLEAR : {} > .
+    .msgpool_core_data_ram             NOCLEAR ALIGN(4) : {} > .
+    .msgpool_core_ctrl_ram             NOCLEAR ALIGN(4) : {} > .
+    //-----------------------------------------------------------------------
+    .mailbox_trans_ram                 NOCLEAR : {} > .
+    .msgpool_trans_dma_ram             NOCLEAR ALIGN(4) : {} > .
+    .msgpool_trans_ctrl_ram            NOCLEAR ALIGN(4) : {} > .
+
+    .dump_mailboxes_descriptor_end = .;
+    __dump_mailboxes_descriptor_size = . - __dump_mailboxes_descriptor_base; //To get the Mailboxes size for assert dump.
+
+    .warm_reset_stack                 NOCLEAR : {} > SCRATCH_RAM_BSS
+    .cpu_gate                         NOCLEAR : {} > .
+     __bss_boot_shared_base = .;
+    .bss_boot_shared_start                    : {} > .
+    .bss_boot_shared                  NOCLEAR : {
+    #if MEDIABANK_NUM > 1
+     #if HALTEST_BUILD
+                                                  "core.o(.bss_shared*)"
+                                                  "solcommanddispatcher.o(.bss*)"
+                                                  "soltestsummary.o(.bss*)"
+                                                  "hmain.o(.bss*)"
+                                                  "fixtures.o(.bss*)"
+                                                  "spiflash_testfixture.o(.bss*)"
+     #else // HALTEST_BUILD
+                                                  "Assert.o(.bss_shared*)"
+                                                  "InitState.o(.bss*)"
+                                                  "FConfigStream.o(.bss_shared*)"
+      #if ENABLE_SIDE_TRACE
+                                                  "SideTrace.o(.bss_shared*)"
+      #endif // ENABLE_SIDE_TRACE
+                                                  "spiflash_policy.o(.bss_shared*)"
+                                                  "trans_uart.o(.bss_shared*)"
+                                                  //"uart_protocol.o(.bss_shared*)"
+                                                  "taprouter.o(.bss_shared*)"
+     #endif // HALTEST_BUILD
+    #endif // MEDIABANK_NUM > 1
+                                                }  > .
+    .bss_boot_shared_end              NOCLEAR : {} > .
+    __bss_boot_shared_size = . - __bss_boot_shared_base; // End of BSS boot shared
+#ifndef HALTEST_BUILD
+    // Anything that is garbage and we don't want it in the image, get rid of it.
+    .garbagebinRODATA                  : { libsedgnoe_xvtbl.a(error.o(.rodata)) libeecnoe_xvtbl.a(throw.o(.rodata))} > .
+    .garbagebinTEXT                    : { libsedgnoe_xvtbl.a(error.o(.text)) libeecnoe_xvtbl.a(throw.o(.text))} > .
+    //.garbagebinBSS                     : { libsedgnoe_xvtbl.a(error.o(.bss)) libeecnoe_xvtbl.a(throw.o(.bss))} > . // There apparently isn't anything in .BSS from error.o, but if there is we can re-enable this.
+#endif
+
+    //-----------------------------------------------------------------------
+    // SYMBOLS
+    //-----------------------------------------------------------------------
+    __cs_timer                   = CS_TIMER;
+    .DRAM_BASE                   = PROGRAM_DRAM_BASE;
+    .DRAM_DATA_BASE              = DATA_DRAM_BASE;
+    __dram_base                  = PROGRAM_DRAM_BASE;
+    __program_dram_base          = PROGRAM_DRAM_BASE;
+    __program_dram_size          = PROGRAM_DRAM_SIZE;
+
+    __dram_virtual_addr_offset   = DRAM_VIRTUAL_ADDRESS_OFFSET;
+    __data_dram_base             = DATA_DRAM_BASE;
+    __data_dram_size             = DATA_DRAM_SIZE;
+    __data_dram_preload_size     = DATA_DRAM_PRELOAD_SIZE;
+
+    __shared_dram_base           = SHARED_DRAM_BASE;
+    __shared_dram_size           = SHARED_DRAM_SIZE;
+    __sram_buffer_base           = SCRATCH_RAM_BASE;
+
+    __fwupd_overlay_base         = __sys_stack_end;
+    __fwupd_overlay_size         = __sys_stack_size;
+
+    __page_table_size            = (PAGE_TABLE_DRAM_SIZE / PROCESSOR_NUM);
+    __page_table_core0_base      = PAGE_TABLE_DRAM_BASE;
+    __page_table_core0_size      = __page_table_size;
+    __page_table_core1_base      = __page_table_core0_base + __page_table_core0_size;
+    __page_table_core1_size      = __page_table_size;
+#if (PROCESSOR_NUM > 2)
+    __page_table_core2_base      = __page_table_core1_base + __page_table_core1_size;
+    __page_table_core2_size      = __page_table_size;
+    __page_table_core3_base      = __page_table_core2_base + __page_table_core2_size;
+    __page_table_core3_size      = __page_table_size;
+#endif // (PROCESSOR_NUM > 2)
+
+    __table_builder_info_size          = (TABLE_BUILDER_INFO_SIZE / PROCESSOR_NUM);
+    __table_builder_info_core0_base    = __table_builder_info_base;
+    __table_builder_info_core1_base    = __table_builder_info_core0_base + __table_builder_info_size;
+#if (PROCESSOR_NUM > 2)
+    __table_builder_info_core2_base    = __table_builder_info_core1_base + __table_builder_info_size;
+    __table_builder_info_core3_base    = __table_builder_info_core2_base + __table_builder_info_size;
+#endif // (PROCESSOR_NUM > 2)
+
+    // Register block locations, called out as externs.
+    __gic_cpu_base               = PERIPHBASE;
+    __gic_dist_base              = MEMADDR(GIC500);
+    __gic_redist_base0           = __gic_dist_base + 0x80000;
+    __gic_redist_base1           = __gic_dist_base + 0xA0000;
+    __gic_redist_base2           = __gic_dist_base + 0xC0000;
+    __gic_redist_base3           = __gic_dist_base + 0xE0000;
+
+    __socipctrl_register_base    = MEMADDR(SOCIPCTRL);
+    __cpuif_register_base        = MEMADDR(CPUIF);
+    __nmcgrb_register_base       = MEMADDR(NMCGRB);
+
+    __dmt0_register_base         = MEMADDR(DMT0);
+    __dmt1_register_base         = MEMADDR(DMT1);
+    __dlm0_register_base         = MEMADDR(DLM0);
+    __dlm1_register_base         = MEMADDR(DLM1);
+
+    __dmt0_dbuf_base         = MEMADDR(DMT0_DBUF);
+    __dmt0_dbuf_end          = MEMENDADDR(DMT0_DBUF);
+    __dmt1_dbuf_base         = MEMADDR(DMT1_DBUF);
+    __dmt1_dbuf_end          = MEMADDR(DMT1) + 0x600;
+
+    __dmt_dbuf_size          = SIZEOF(DMT0_DBUF);   //Both DBUFs have the same size. GD VP 2.1.1: 4K
+    __dmt_module_offset      = (__dmt1_register_base - __dmt0_register_base);
+    __dmt_dbuf_module_offset = (__dmt1_dbuf_base - __dmt0_dbuf_base);
+
+    __sysctrl_register_base      = MEMADDR(SYSCTRL);
+    __intctrl_register_base      = MEMADDR(INTCTRL);
+
+    __lcor_register_base         = MEMADDR(LCOR);
+    __lpac_register_base         = MEMADDR(LPAC);
+
+    __scx0_register_base         = MEMADDR(SCX0);
+    __scx1_register_base         = MEMADDR(SCX1);
+    __scx_module_offset          = (__scx1_register_base - __scx0_register_base);
+    __scx_module_size            = 4K;
+
+    __xor_register_base          = MEMADDR(XOR);
+    __softxor_register_base      = MEMADDR(SOFT_XOR);
+
+    __pwg_register_base          = MEMADDR(PWG);
+
+    __uart_base                  = MEMADDR(UART);
+    __ntp_register_base          = MEMADDR(NTP0);
+    __ntl_register_base          = MEMADDR(NTL);
+    __ntp_module_size            = NTP_PER_UNIT_SIZE;
+    __ntp_module_offset          = (NTP_PER_UNIT_SIZE * 2);
+    __nps_module_size            = NPS_PER_UNIT_SIZE;
+
+    __tlm_register_base          = MEMADDR(TLM);
+    __tll_sram_base              = MEMADDR(TLL_SRAM);
+    __tll_sram_size              = SIZEOF(TLL_SRAM);
+
+    __tbuf_register_base         = MEMADDR(TBUF);
+    __tbuf_register_size         = SIZEOF(TBUF);
+    __tbuf_cache0_base           = TBUF_SRAM_CACHE0_BASE;
+    __tbuf_cache1_base           = TBUF_SRAM_CACHE1_BASE;
+    __tbuf0_start                = MEMADDR(TBUF0_SRAM);
+    __tbuf0_end                  = MEMENDADDR(TBUF0_SRAM);
+    __tbuf0_size                 = SIZEOF(TBUF0_SRAM);
+    __tbuf1_start                = MEMADDR(TBUF1_SRAM);
+    __tbuf1_end                  = MEMENDADDR(TBUF1_SRAM);
+    __tbuf1_size                 = SIZEOF(TBUF1_SRAM);
+    __tbuf0_core_offset          = (__tbuf0_start - __tbuf_cache0_base);
+    __tbuf1_core_offset          = (__tbuf1_start - __tbuf_cache1_base);
+
+    __spi_base                   = MEMADDR(SPI);
+    __spi_size                   = 4K; // NOTE:  Size is used in GHS scripts
+
+    __gpv_base                   = MEMADDR(GPV);
+
+    __gpio0_base                 = MEMADDR(GPIO0_BASE);
+    __gpio0_size                 = GPIO_SIZE;
+    __gpio1_base                 = MEMADDR(GPIO1_BASE);
+    __gpio1_size                 = GPIO_SIZE;
+    __gpio2_base                 = MEMADDR(GPIO2_BASE);
+    __gpio2_size                 = GPIO_SIZE;
+
+    __apblogger_base             = MEMADDR(APBLOGGER);
+
+    __i2c_base                   = MEMADDR(I2C_REGS);
+    __otp_base                   = MEMADDR(OTP);
+    __keycache_register_base     = MEMADDR(KEYCACHE0);
+    __keycache1_register_base    = MEMADDR(KEYCACHE1);
+
+    __fem_i2c_register_base      = FEM_I2C;  //FPGA-specific resides within PSS memory region FEP.
+    __fem_mdio_register_base     = FEM_MDIO; //FPGA-specific resides within PSS memory region FEP.
+
+    REGS_FEM                     = FEM_MDIO; //FPGA-specific resides within PSS memory region FEP.
+    __ddr_phy_base               = MEMADDR(DDRPHY);
+    __ddrctlr_base               = MEMADDR(DDRCTLR);
+
+    __rom_profile_base           = MEMADDR(ROM_PROFILE);
+
+    // North
+    __mmio_register_base         = MEMADDR(MMIO0);
+    __mmio_module_size           = SIZEOF(MMIO0);
+
+    __mmio1_register_base        = MEMADDR(MMIO1);
+    __mmio1_module_size          = SIZEOF(MMIO1);
+
+    __sqp_register_base          = MEMADDR(SQP0);
+    __sqp_module_size            = SIZEOF(SQP0);
+
+    __sqp1_register_base         = MEMADDR(SQP1);
+    __sqp1_module_size           = SIZEOF(SQP1);
+
+    __cqp_register_base          = MEMADDR(CQP0);
+    __cqp_module_size            = SIZEOF(CQP0);
+
+    __cqp1_register_base         = MEMADDR(CQP1);
+    __cqp1_module_size           = SIZEOF(CQP1);
+
+    __npl_register_base          = MEMADDR(NPL0);
+    __npl_module_size            = SIZEOF(NPL0);
+
+    __npl1_register_base         = MEMADDR(NPL1);
+    __npl1_module_size           = SIZEOF(NPL1);
+
+    __nplext_register_base       = MEMADDR(NPLEXT0);
+    __nplext_module_size         = SIZEOF(NPLEXT0);
+
+    __nplext1_register_base      = MEMADDR(NPLEXT1);
+    __nplext1_module_size        = SIZEOF(NPLEXT1);
+
+    __rdma_register_base         = MEMADDR(RDMA0);
+    __rdma_module_size           = SIZEOF(RDMA0);
+
+    __rdma1_register_base        = MEMADDR(RDMA1);
+    __rdma1_module_size          = SIZEOF(RDMA1);
+
+    __wdma_register_base         = MEMADDR(WDMA0);
+    __wdma_module_size           = SIZEOF(WDMA0);
+
+    __wdma1_register_base        = MEMADDR(WDMA1);
+    __wdma1_module_size          = SIZEOF(WDMA1);
+
+    __nplmbox_register_base      = MEMADDR(NPLMBOX0);
+    __nplmbox_module_size        = SIZEOF(NPLMBOX0);
+    __nplmbox_size               = MBOX_SIZE;
+
+    __nplmbox1_register_base     = MEMADDR(NPLMBOX1);
+    __nplmbox1_module_size       = SIZEOF(NPLMBOX1);
+    __nplmbox1_size              = MBOX_SIZE;
+
+    __pss_port0_register_base    = MEMADDR(PSS_PORT0);
+    __pss_port1_register_base    = MEMADDR(PSS_PORT1);
+    __pss_port2_register_base    = MEMADDR(PSS_PORT2);
+
+    __vnlt_register_base         = MEMADDR(VNLT0);
+    __vnlt_module_size           = SIZEOF(VNLT0);
+
+    __vnlt1_register_base        = MEMADDR(VNLT1);
+    __vnlt1_module_size          = SIZEOF(VNLT1);
+
+#if CT==CT_SENTINELROCKPLUS_VEP ///< @todo: VEPN-3182:remove once this is resolved by vp team
+    __fnlt_register_base         = __vnlt_register_base + 0x300;
+    __fnlt1_register_base        = __vnlt1_register_base + 0x300;
+#else // CT==CT_SENTINELROCKPLUS_VEP
+    __fnlt_register_base         = __vnlt_register_base;
+    __fnlt1_register_base        = __vnlt1_register_base;
+#endif // CT==CT_SENTINELROCKPLUS_VEP
+
+    __icmb_register_base         = MEMADDR(ICMB0);
+    __icmb_module_size           = SIZEOF(ICMB0);
+
+    __icmb1_register_base        = MEMADDR(ICMB1);
+    __icmb1_module_size          = SIZEOF(ICMB1);
+
+    __rdrp_register_base         = MEMADDR(NPL0_RDRP0);
+    __rdrp_module_size           = SIZEOF(NPL0_RDRP0);
+
+    __rdrp1_register_base        = MEMADDR(NPL0_RDRP1);
+    __rdrp1_module_size          = SIZEOF(NPL0_RDRP1);
+
+    __wdrp_register_base         = MEMADDR(NPL0_WDRP0);
+    __wdrp_module_size           = SIZEOF(NPL0_WDRP0);
+
+    __wdrp1_register_base        = MEMADDR(NPL0_WDRP1);
+    __wdrp1_module_size          = SIZEOF(NPL0_WDRP1);
+
+    __sglm_register_base         = MEMADDR(SGLM0);
+    __sglm_module_size           = SIZEOF(SGLM0);
+
+    __sglm1_register_base        = MEMADDR(SGLM1);
+    __sglm1_module_size          = SIZEOF(SGLM1);
+
+    __npl_mbuf_sram_base         = MEMADDR(NPLMBOX_SRAM0);
+    __npl_mbuf_sram_size         = SIZEOF(NPLMBOX_SRAM0);
+
+    __npl_mbuf_sram1_base        = MEMADDR(NPLMBOX_SRAM1);
+    __npl_mbuf_sram1_size        = SIZEOF(NPLMBOX_SRAM1);
+
+    __cdbuf_sram_base            = MEMADDR(CDBUF_SRAM0);
+    __cdbuf_sram_size            = SIZEOF(CDBUF_SRAM0);
+
+    __cdbuf_sram1_base           = MEMADDR(CDBUF_SRAM1);
+    __cdbuf_sram1_size           = SIZEOF(CDBUF_SRAM1);
+
+    __orombuf_sram_base          = MEMADDR(OROM_SRAM0);
+    __orombuf_sram_size          = MEMENDADDR(OROM_SRAM0);
+
+    __orombuf_sram1_base         = MEMADDR(OROM_SRAM1);
+    __orombuf_sram1_size         = MEMENDADDR(OROM_SRAM1);
+
+    __vbuf_sram_base             = MEMADDR(VBUF_SRAM0);
+    __vbuf_sram_size             = MEMENDADDR(VBUF_SRAM0);
+
+    __vbuf_sram1_base            = MEMADDR(VBUF_SRAM1);
+    __vbuf_sram1_size            = MEMENDADDR(VBUF_SRAM1);
+
+    __cmb_sram_base              = MEMADDR(CMB_SRAM0);
+    __cmb_sram_size              = MEMENDADDR(CMB_SRAM0);
+
+    __cmb_sram1_base             = MEMADDR(CMB_SRAM1);
+    __cmb_sram1_size             = MEMENDADDR(CMB_SRAM1);
+
+    __sglm_sram_base             = MEMADDR(SGLM_SRAM0);
+    __sglm_sram_size             = MEMENDADDR(SGLM_SRAM0);
+
+    __sglm_sram1_base            = MEMADDR(SGLM_SRAM1);
+    __sglm_sram1_size            = MEMENDADDR(SGLM_SRAM1);
+
+    __pfnrst_reg                 = __mmio_register_base + 0x1000C0;
+    __vfnrst_reg                 = __mmio_register_base + 0x1000C4;
+
+    __nplext_mbuf_sram_pm_status = __nplext_register_base + 0x800 + 0x40 + 0x14;
+
+    __psscsr_reg                 = __nplext_register_base + 0x34;
+
+#if HAL_PLATFORM_VEP
+    __vp_base                    = MEMADDR(VEP);
+#endif // HAL_PLATFORM_VEP
+
+#if (ENABLE_HARNESS)
+    __comms_base                 = MEMADDR(COMMS);
+    __comms_size                 = COMMS_SIZE;
+    __fixture_base               = MEMADDR(FIXTURE);
+    __fixture_size               = FIXTURE_SIZE;
+#endif // ENABLE_HARNESS
+
+}

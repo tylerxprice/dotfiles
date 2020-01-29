@@ -1,0 +1,55 @@
+# START REPLACING COMMON INCLUDE FOR NOW
+#include ../../projects/common/common.mk
+
+#C_FILES += $(shell find $(SRC_PATH) -name "*.c")
+#C_FILES = $(wildcard intel/*.c)
+#Just cherry pick which files for now
+#C_FILES += intel/nand/mhalnand_api.c
+C_FILES += intel/queuing/submissionq.c
+#C_FILES += intel/queuing/channelqueue.c
+#C_FILES += intel/queuing/commandcontext.c
+#C_FILES += intel/queuing/completer.c
+#C_FILES += intel/queuing/completionq.c
+#C_FILES += intel/queuing/diestate.c
+#C_FILES += intel/queuing/dispatcher.c
+#C_FILES += intel/queuing/mhalworker.c
+#C_FILES += intel/queuing/readyq.c
+#C_FILES += intel/queuing/rescheduleq.c
+#C_FILES += intel/queuing/submissionq.c
+#C_FILES += intel/queuing/taskbuilder.c
+S_FILES += $(shell find $(SRC_PATH) -name "*.S")
+s_FILES += $(shell find $(SRC_PATH) -name "*.s")
+
+# Object files
+OBJS += $(C_FILES:.c=.o)
+OBJS += $(S_FILES:.S=.o)
+OBJS += $(s_FILES:.s=.o)
+# END REPLACING COMMON INCLUDE FOR NOW
+
+.DEFAULT_GOAL = all
+
+SRC_PATH = .
+
+INCLUDES += -I./inc                  #mhalnand_api.h, etc.
+INCLUDES += -I./intel/queuing/       #needed?
+INCLUDES += -I./intel/iphal/inc/     #nsctask_api.h, etc.
+INCLUDES += -I./intel/iphal/drv/inc/ #nsc.h
+
+MHAL_LIB = libmhal.a
+
+$(MHAL_LIB): $(OBJS)
+	$(CC) -o $@ $^
+
+all: $(MHAL_LIB)
+
+# START REPLACING COMMON CLEAN MAKEFILE INCLUDE FOR NOW
+#include ../../projects/common/clean.mk
+clean: $(OBJS)
+	rm -f $(OBJS) $(MHAL_LIB)
+# END REPLACING COMMON CLEAN MAKEFILE INCLUDE FOR NOW
+
+.PHONY: test
+test:
+	@echo $(OBJS)
+	@echo $(C_FILES)
+	@echo $(SRC_PATH)

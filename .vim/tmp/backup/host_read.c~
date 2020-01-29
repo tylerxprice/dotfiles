@@ -1,0 +1,3812 @@
+/*
+ * INTEL CONFIDENTIAL
+ *
+ * Copyright 2010-2018 Intel Corporation All Rights Reserved.
+ *
+ * The source code contained or described herein and all documents related to
+ * the source code ("Material") are owned by Intel Corporation or its
+ * suppliers or licensors. Title to the Material remains with Intel
+ * Corporation or its suppliers and licensors. The Material contains trade
+ * secrets and proprietary and confidential information of Intel or its
+ * suppliers and licensors. The Material is protected by worldwide copyright
+ * and trade secret laws and treaty provisions. No part of the Material may be
+ * used, copied, reproduced, modified, published, uploaded, posted,
+ * transmitted, distributed, or disclosed in any way without Intel's prior
+ * express written permission.
+ *
+ * No license under any patent, copyright, trade secret or other intellectual
+ * property right is granted to or conferred upon you by disclosure or
+ * delivery of the Materials, either expressly, by implication, inducement,
+ * estoppel or otherwise. Any license under such intellectual property rights
+ * must be express and approved by Intel in writing.
+ *
+ *****************************************************************************/
+
+/**
+ * @file
+ * Host Read Handler
+ * @ingroup CoreInterface
+ * @addtogroup CoreInterface
+ * @{
+ */
+
+#include "product.h"                // Should be the first include file.
+
+#include "nandwork.h"               //Nand_Work_GetTotalCount indirect include nanddiscovery.h, nandqueue.h, mediaformat.h, nandaddr.h, eccengine.h, XorHal.h
+#include "transport.h"              //READ_ZERO_FILL_FLAG_MASK indirect include types.h, kernel.h, trans_core_ifc.h, retentionmem\include\retentionmem_global.h
+#include "CoreConfig.h"             //CoreConfig_GetConfiguredSectorsPerPage indirect include types, util, lba_util
+
+#if (ENABLE_HITACHI_TRANSPORT == 1)
+#include "trans_private.h"          //Trans_MarkAsDispatchComplete  indirect include bootinfo_public.h", transport.h, trans_data_types.h, mailbox.h, trans_core_ifc.h, slowctx_shared.h, Stats.h, ThermalHal.h, fconfig_shared.h, transport.h, cmd_context.h
+#endif // (ENABLE_HITACHI_TRANSPORT == 1)
+
+#include "core_cmd_queue_manager.h" //CmdQ_HostRead_IncrementReadyForXport indirect include types.h, core.h, transport.h, core_interface.h
+#include "container.h"              //Work_Container_DecCount indirect include Core_callback, util, types
+#include "indirection.h"            //L2P_GetNandAddressToLbaOffset indirect include types.h, transferbuffer.h, lba_util.h
+#include "host_read.h"              //HostRead_Init indirect include core.h, types.h, indirection.h, trans_core_ifc.h
+#include "read_private.h"           //GetReadZeroDataBuffSizeSectors indirect include types.h, indirection.h, trans_core_ifc.h
+#if HOST_NVME
+#include "host_write_compare.h"     //HostWriteCompare_SetupHostDma indirect include core.h, types.h
+#endif // HOST_NVME 
+#include "transferbuffer.h"         //Tbuf_GetBufferSectorDwordAddress indirect include writestreammanager, types, CoreConfig
+#include "initstate.h"
+#include "readdisturb.h"            //ReadDisturb_DoWeRelocate indirect include Tc_public.h
+#include "band.h"                   //Band_DecrementReadCount indirect include types.h, CoreConfig.h, indirection.h, util.h, LBATokens.h, writestreammanager.h, transferbuffer.h, nanddiscovery.h", Tc_Public.h, defrag.h, xorparity.h
+#include "PliInject.h"              //PliInject_AccessCheck indirect include tc_shared.h
+#include "trans_core_ifc.h"         //TransIfc_GetDmaDesc indirect include types.h, extendedsense.h
+#include "gl_uec.h"                 //UEC_CMD_DONE
+#include "Nlog.h"                   //NLog_Host_4
+#include "collision_checker.h"
+#include "cmi_downstream_send.h"
+#include "core_media_ifc.h"
+
+#define NLOG_SOURCE_FILE NLOG_SOURCE_SRC_CORE_CLIENTS_HOSTREAD_HOST_READ_C
+
+#pragma ghs section data = default
+
+static uint32_t gZeroDataIdx;
+static ReadVerifyErrorMask_t gVerifyError;
+
+#if (HOST_NVME && ENABLE_ERROR_INJECTION)
+static PiErrorInjection_t piData;
+
+static bool  IsPiErrorInjectionEnabled(void);
+static lba_t GetPiErrorCorruptLba(void);
+#endif // (HOST_NVME && ENABLE_ERROR_INJECTION)
+
+//---------------------------------------------------------------------------
+//  Sunset Cove portability workaround...
+//  SC created a gross abomination of calling directly into transport code
+//  from here :-P  We need this stubbed for Fultondale.
+#if !(ENABLE_ALL_PORTS_ABORT)
+ #ifndef FireAlarm_IsSouthAborted
+  #define FireAlarm_IsSouthAborted() 0
+ #endif // FireAlarm_IsSouthAborted
+#endif // !(ENABLE_ALL_PORTS_ABORT)
+
+#pragma ghs section bss = default
+
+// Handy for doing reads on a asserted drive
+volatile NandAddr_t physReadAddr;
+
+//
+// Once we are this far away from running out of host allocated transfer buffer space,
+// we need to flush out any DMA and yield to allow transfer to complete and free up buffer
+//
+#define HOST_BUFFER_ALLOCATION_YIELD_POINT 32
+
+#if ENABLE_PAGE_SIZE_INDIRECTION
+///check to see if MAX_DESCRIPTOR_SIZE = DRIVER_STRIPE_SIZE(255) - INDIRECTION_GRANULARITY
+#define MAX_DESCRIPTOR_SIZE                225
+#else // ENABLE_PAGE_SIZE_INDIRECTION
+//descriptor count is 8 bits.  restrict the size of a single descriptor to 240
+#define MAX_DESCRIPTOR_SIZE                240
+#endif // ENABLE_PAGE_SIZE_INDIRECTION
+
+#define OPTIMAL_MERGE_SIZE                 32
+#define PERF_OPTIMAL_MERGE_SIZE            16
+
+#if ENABLE_IU_ALIGNED_READS
+#define RSP_NAND_HIT_MAX_IU_COUNT          32    // Support up to 32 IUs, i.e., up to 128K block host reads
+
+/**
+ * Structure to hold RSP hit metrics information
+ */
+typedef struct
+{
+    uint32_t    die;
+    uint32_t    baseEb;
+    uint32_t    page;
+} RspNandHitMetrics_t;
+
+static RspNandHitMetrics_t      rspNandHitMetrics[RSP_NAND_HIT_MAX_IU_COUNT];   // Used to store location information for each IU.
+static snapReadEnable_e         iuSnapReadEnable[RSP_NAND_HIT_MAX_IU_COUNT];    // Used to identify QP/RSP dispatch for each IU.
+static uint32_t                 iuDispatchOrder[RSP_NAND_HIT_MAX_IU_COUNT];     // USed to re-order IUs to dispatch all IUs located on same page in order.
+#endif // ENABLE_IU_ALIGNED_READS
+
+#if ENABLE_READ_CACHE_HITS
+uint32_t  rdCacheSlots[SECTORCOUNT2IUCOUNT(FCONFIG_MAX_RD_CACHE_STRIPE_SIZE)];
+
+ #if ENABLE_PAGE_ALIGNED_READS
+static void HostRead_DispatchDmaIfDone(uint32_t sectorsRemaining, const dataCmdDesc_t *pCmd);
+static void HostRead_FillCacheSlotIfNeededForHostRead(uint32_t csId, uint32_t bitMask);
+static void HostRead_LockCacheSlotsAssociatedWithHostRead(lba_t hostLBA, uint32_t sectorCount, uint32_t startOff);
+static bool HostRead_DoesCacheHaveHostRead(lba_t hostLBA, uint32_t sectorCount, uint32_t startOff);
+ #endif // ENABLE_PAGE_ALIGNED_READS
+#endif // ENABLE_READ_CACHE_HITS
+
+typedef enum
+{
+    HOST_READ_COMPARE, 
+    HOST_READ_VERIFY,
+    HOST_READ_SELF_TEST_VERIFY, 
+} slowFillReason_e;
+
+
+#pragma ghs section
+
+// Private declarations and defines
+static uint32_t CalculateFirstIuRead(lba_t             startLba,
+                                     uint32_t          count, 
+                                     ploc_t           *bandLocation,
+                                     NandAddr_t       *nandAddr,
+                                     LengthPageRead_t *pageLen,
+                                     uint32_t         *totalPages);
+
+static void CalculateLastPageRead(uint32_t          count,
+                                  uint32_t          sectorCountOnNewPage,
+                                  ploc_t           *bandLocation,
+                                  NandAddr_t       *nandAddr,
+                                  LengthPageRead_t *pageLen,
+                                  uint32_t         *totalPages);
+
+static void  SendDmaDesc(const dataCmdDesc_t *pCmd);
+
+static void DispatchRead_NonPerf(lba_t            lba,
+                                 uint32_t         sectorCount,
+                                 ploc_t           bandLocation,
+                                 uint32_t         cmdContainerId,
+                                 slowFillReason_e reason);
+
+#if ENABLE_PAGE_ALIGNED_READS
+static void HostRead_FastTransfer(lba_t                hostLpa,
+                                  uint32_t             sectorCount,
+                                  uint32_t             containerId,
+                                  const dataCmdDesc_t *pCmd,
+                                  uint32_t             sectorOffsetAdj);
+
+ #if ENABLE_IU_ALIGNED_READS
+static void HostRead_IuAlignedFastTransfer(lba_t                hostLpa,
+                                           uint32_t             sectorCount,
+                                           uint32_t             containerId,
+                                           const dataCmdDesc_t *pCmd);
+#endif // ENABLE_IU_ALIGNED_READS
+
+ #if (!(RAMDISK_BUILD) && !(HAL_PLATFORM_VEP) && !(ENABLE_PAGE_SIZE_INDIRECTION))
+static void HostRead_Fast4kRead(lba_t                hostLpa,
+                                uint32_t             containerId,
+                                const dataCmdDesc_t *pCmd);
+  #if ENABLE_HITACHI_TRANSPORT
+static void HostRead_Fast8kRead(lba_t                hostLpa,
+                                uint32_t             containerId,
+                                const dataCmdDesc_t *pCmd);
+  #endif // ENABLE_HITACHI_TRANSPORT
+ #endif // (!(RAMDISK_BUILD) && !(HAL_PLATFORM_VEP) && !(ENABLE_PAGE_SIZE_INDIRECTION))
+#endif // ENABLE_PAGE_ALIGNED_READS
+
+#if HOST_SATA
+static void HostRead_SetupVerify(lba_t                lba,
+                                 uint32_t             sectorCount,
+                                 uint32_t             cmdContainerId,
+                                 const dataCmdDesc_t *pCmd,
+                                 bool                 last);
+#endif // HOST_SATA
+
+#if HOST_NVME
+static void HostRead_SetupCompareChunk(lba_t                lba,
+                                       uint32_t             sectorCount,
+                                       uint32_t             cmdContainerId,
+                                       const dataCmdDesc_t *pCmd,
+                                       bool                 last);
+
+static void HostRead_CompareInit(void);
+
+compareContext_t compareContext;
+
+#endif // HOST_NVME
+
+#if (!ENABLE_PAGE_ALIGNED_READS)
+static void HostRead_SetupHostDma          (lba_t                hostLba,
+                                            uint32_t             sectorCount,
+                                            uint32_t             cmdContainerId,
+                                            const dataCmdDesc_t *pCmd,
+                                            bool                 last,
+                                            uint32_t             sectorOffsetAdj);
+
+ #if ENABLE_4K_HOT_PATH
+static void HostRead_Fast4kRead_Sata       (lba_t                hostLpa,
+                                            uint32_t             containerId,
+                                            const dataCmdDesc_t  *pCmd);
+ #endif // ENABLE_4K_HOT_PATH
+
+static void HostRead_SetupHostTransferSata (const lba_t         hostLBA,
+                                            const uint32_t      sectorCount,
+                                            const dataCmdDesc_t *pCmd,
+                                            uint32_t            containerId);
+#endif // (!ENABLE_PAGE_ALIGNED_READS)
+
+void ReadCallback(uint32_t bufferIndex, uint32_t sectors, NandAddr_t nandAddr, transDmaDesc_t *pDma);
+void ReadVerifyCallback(uint32_t buffIndex, uint32_t sectors, uint32_t containerId, NandAddr_t nandAddr);
+void ReadCompareCallback(uint32_t bufferIndex, uint32_t sectors, uint32_t containerId, NandAddr_t nandAddr);
+void HostReadBufferFill(NandAddr_t nandAddr, uint32_t bufferIndex, uint32_t sectorCount, uint32_t callbackContext, snapReadEnable_e snapReadEnable);
+void HostReadSlowBufferFill(NandAddr_t nandAddr, uint32_t bufferIndex, uint32_t sectorCount, slowFillReason_e reason, lba_t lba, uint32_t containerId);
+
+uint32_t HostRead_GetBufferOffset(const transDmaDesc_t *pDma, uint32_t workBufferOffset);
+
+#if ENABLE_SCAN_TBUF_FOR_UNC_BEFORE_DMA
+/**
+ * Scan the 1st sector of the tbuf entry for the UNC token.
+ */
+inline bool HostRead_TbufContainsUncErrors(const uint32_t buffIndex, tbufLba_t* errorLba)
+{
+    const tbufLba_t tokenValue = Tbuf_GetBufferLbaToken(buffIndex);
+
+    // Check for uncorrectable token
+    if(LBA_TOKEN_UNCORRECTABLE == tokenValue)
+    {
+        *errorLba = Tbuf_GetBufferLbaFromCrc(buffIndex);
+        return true;
+    }
+
+    return false;
+}
+#endif // ENABLE_SCAN_TBUF_FOR_UNC_BEFORE_DMA
+
+static transDmaDesc_t *gpActiveDma;
+
+#if ENABLE_HMI_TOKEN_0
+CASSERT_TAG(zeroContentLbaTag, TOKEN_0_LBA_TAG == LBA_TOKEN_ZERO_FILL);
+#endif // ENABLE_HMI_TOKEN_0
+
+#pragma ghs section text=".text_dram", data=".data_dram", bss=".bss_dram_uncached", rodata=".rodata_dram"
+
+void HostRead_Init(void)
+{
+    gpActiveDma = NULL;
+
+    // NULL buffer index signals the HMT_Transfer function to do a zero fill to host.
+    SetGlobalZeroDataIdx(NULL16);
+
+#if HOST_NVME
+    HostRead_CompareInit();
+#endif // HOST_NVME
+
+    SnapRead_InitHostReadStats();
+}
+
+
+#if HOST_NVME
+void HostRead_CompareInit(void)
+{
+    memset((void*)&compareContext, 0, sizeof(compareContext));
+}
+
+bool HostRead_Compare(uint32_t chunkId)
+{
+    compareChunk_t     *pChunk;
+    uint8_t            *hostData;
+    uint8_t            *nandData;
+    size_t              size;
+
+    // Retrieve context info
+    pChunk     = &compareContext.chunk[chunkId];
+    size       = pChunk->sectorCount * HalTbuf_GetSectorSize();
+    hostData   = (uint8_t *)Tbuf_GetBufferSectorDwordAddress(pChunk->hostBuffIdx, 0);
+    nandData   = (uint8_t *)Tbuf_GetBufferSectorDwordAddress(pChunk->nandBuffIdx, 0);
+
+    return (bool)(memcpyAssert_s(hostData, size, nandData, size) == 0);
+}
+
+#if !ENABLE_CMI_READ_PATH
+REGISTER_CALLBACK(CallBack_NAND_Work_HostReadCompare, HostRead_CompareNandWorkCallback);
+#endif // !ENABLE_CMI_READ_PATH
+/**
+ * Nand callback for HostRead_SetupCompareNandXfer.
+ *
+ * @param   workID  nand work id.
+ */
+void HostRead_CompareNandWorkCallback(uint32_t workID)
+{
+#if !ENABLE_CMI_READ_PATH
+    uint32_t            bufferIndex      = Nand_Work_GetBufferPtrA_hf(workID);
+    uint32_t            sectors          = Nand_Work_GetTotalCount(workID);
+    uint32_t            containerId      = Nand_Work_GetContainer(workID);
+    NandAddr_t          nandAddr         = Nand_Work_GetAddressA_hf(workID);
+
+    ReadCompareCallback(bufferIndex, sectors, containerId, nandAddr);
+
+    Nand_Work_PutEntry(workID);
+#endif // !ENABLE_CMI_READ_PATH
+}
+
+#if ENABLE_CMI_READ_PATH
+/**
+ * CMI Read callback to complete compare command.
+ *
+ * @param header Pointer to CMI message header.
+ * @param context Contextual data for the CMI message.
+ */
+void HostRead_CompareCmiCallback(cmiMsgHeader_t *header, contextData_t *context)
+{
+    cmiReadMessage_t *readMessage;
+
+    readMessage = CMI_Downstream_GetReadMessageHandle(header);
+    ASSERT(readMessage != NULL); /// ASSERT_CI280: Unable to get read message handle for CMI message header
+
+    ReadCompareCallback(
+            readMessage->bufferOffset, 
+            readMessage->numberOfSectors, 
+            CoreMediaIfc_GetContainerId(context), 
+            readMessage->physicalAddress);
+
+    CoreMediaIfc_ClearCmiContextInformation(header->msgid);
+}
+#endif // ENABLE_CMI_READ_PATH
+
+/**
+ * Common callback to complete compare commands.
+ *
+ * @param   bufferIndex Transfer buffer destination for data.
+ * @param   sectors     Number of sectors read.
+ * @param   containerId Container id associated with read command.
+ * @param   nandAddr    Nand address the read targeted.
+ */
+void ReadCompareCallback(uint32_t bufferIndex, uint32_t sectors, uint32_t containerId, NandAddr_t nandAddr)
+{
+    WCM_SetValid(bufferIndex, sectors);
+
+    Work_Container_DecCount(containerId, sectors);
+
+    if (Work_Container_IsAllWorkDone(containerId))
+    {
+        CallBack_ContainerfptrArray[Work_Container_GetCallback(containerId)](containerId);
+    }
+
+    // Copying the same bookkeeping as the normal reads for consistency
+    Band_DecrementReadCount(nandAddr);
+}
+
+void HostRead_SetupCompareNandXfer( compareChunk_t      *pChunk,
+                                    const lba_t          lba,
+                                    const uint32_t       sectorCount,
+                                    const uint32_t       ContainerId,
+                                    const dataCmdDesc_t *pCmd,
+                                    const bool           last)
+{
+    lba_t      lpa = LBA2LPA(lba);                  // The start LBA for associated IU
+    ploc_t     bandLocation;                        // physical location of IU associated with LBA
+    NandAddr_t nandAddr[MAX_PAGES_SPANNED_BY_LPA];  // nand address for IU (may be multiple for VSS)
+    Length_t   lpaSplit;                            // number of sectors for IU on each page
+    uint32_t   totalPages;                          // total pages IU is written to (may be 2 for VSS)
+
+    /// @todo  replace
+
+    WCM_HostReadCollisionPolicy(lpa, DONT_REUSE_CACHESLOT);
+
+    // Perform indirection lookup to get band/offset location
+    L2P_GetBandLocation(lpa, &bandLocation);
+
+    // Setup NAND transfer
+ #if RAMDISK_BUILD
+    if (InitState_IsDiscoveryDone())
+ #else // RAMDISK_BUILD
+    if (InitState_IsLogicalEnabled())
+ #endif // RAMDISK_BUILD
+    {
+        if (PLOC_IsInMedia(bandLocation))
+        {
+            Work_Container_IncCount(ContainerId, sectorCount);
+
+            totalPages = L2P_GetNandAddressToLbaOffset(bandLocation, &nandAddr[0], &lpaSplit, LBA2IUOFFSET(lba));
+
+            // neither lba callback context or generic callback context is used by the callback,
+            // but passing it in because original code included it
+            
+            HostReadSlowBufferFill(
+                    nandAddr[0],
+                    pChunk->nandBuffIdx,
+                    sectorCount,
+                    HOST_READ_COMPARE,
+                    (lba_t) compareContext.nextChunk,
+                    ContainerId);
+            
+            if (ReadDisturb_DoWeRelocate(NandAddr_GetEb(nandAddr[0]), NandAddr_GetDie(nandAddr[0]), lba, totalPages))
+            {
+                ReadDisturb_Relocate(NandAddr_GetEb(nandAddr[0]), lba);
+            }
+        }
+        else
+        {
+            /// Data is not on NAND, @todo
+        }
+
+    } //ENDIF: Logical State enabled}
+}
+
+void HostRead_SetupCompareHostXfer(compareChunk_t      *pChunk,
+                                   const lba_t         lba,
+                                   const uint32_t      sectorCount,
+                                   const uint32_t      containerID,
+                                   const dataCmdDesc_t *pCmd,
+                                   const bool          last)
+{
+    HostWriteCompare_SetupHostDma(lba,
+                                  sectorCount,
+                                  containerID,
+                                  pChunk->hostBuffIdx,
+                                  pCmd,
+                                  last,
+                                  0);
+
+}
+
+/**
+ * Prepare for and issue a nand read and initiate a host read for read compares. Issued in chunks of read.
+ *
+ * @param   lba             Starting LBA for read.
+ * @param   sectorCount     Total sectors to read.
+ * @param   cmdContainerId  Container id associated with read command.
+ * @param   pCmd            Data cmd descriptor to provide details on internal cmd index.
+ * @param   last            True if final chunk of read, False otherwise.
+ *
+ * @note    One of several reads that can be issued by HostRead_SectorsNonPerf, requires common function
+ *          signature.
+ */
+void HostRead_SetupCompareChunk(const lba_t         lba,
+                                const uint32_t      sectorCount,
+                                const uint32_t      cmdContainerId,
+                                const dataCmdDesc_t *pCmd,
+                                const bool          last)
+{
+    compareChunk_t  *pChunk;
+    uint32_t         ccContainerID; // Compare chunk work container id
+
+    // Initialize Chunk Data
+    pChunk = &compareContext.chunk[compareContext.nextChunk];
+    pChunk->sectorCount = sectorCount;
+    pChunk->slba        = lba;
+
+    // Allocate Chunk TBUF
+    pChunk->nandBuffIdx = WCM_AllocateHostReadBuffer(sectorCount);
+    pChunk->hostBuffIdx = WCM_AllocateHostReadBuffer(sectorCount);
+
+    CmdQ_HostRead_IncrementAllocated(sectorCount*2);
+
+    // setup work container for this compare chunk
+    ccContainerID = Work_Container_GetEntry();
+    Work_Container_SetCallback(ccContainerID, CallBack_Container_CompareChunk);
+    Work_Container_SetCallBackContext(ccContainerID, compareContext.nextChunk);
+    Work_Container_SetCallBackContext2(ccContainerID, cmdContainerId);
+    Work_Container_SetCount(ccContainerID, 0); // Set count to 0 - just to make sure
+
+    // For debug - store container id's
+    pChunk->ccContainerId = ccContainerID;
+    pChunk->cmdContainerId = cmdContainerId;
+
+    // Initiate NAND Read
+    HostRead_SetupCompareNandXfer(pChunk, lba, sectorCount, ccContainerID, pCmd, last);
+
+    // Initiate Host Read
+    HostRead_SetupCompareHostXfer(pChunk, lba, sectorCount, ccContainerID, pCmd, true);
+
+    // All done setting up compare chunk
+    Work_Container_SetDone(ccContainerID);
+
+    // Setup for next chunk
+    compareContext.nextChunk++;
+    if (compareContext.nextChunk == MAX_COMPARE_CHUNKS)
+    {
+        // Wrap back to first entry
+        compareContext.nextChunk = 0;
+    }
+
+    // Update work container data
+    Work_Container_IncCount(cmdContainerId, 1);
+}
+
+#else  // HOST_NVME
+void HostRead_CompareNandWorkCallback(uint32_t this) {}
+#endif // HOST_NVME
+
+/**
+ * Prepare for and issue a nand read for verify read request.
+ *
+ * @param   lba             Starting LBA for read.
+ * @param   sectorCount     Total sectors to read.
+ * @param   cmdContainerId  Container id associated with read command.
+ * @param   pCmd            Not used. Included to maintain common function signature.
+ * @param   last            Not used. Included to maintain common function signature.
+ *
+ * @note    One of several reads that can be issued by HostRead_SectorsNonPerf, requires common function
+ *          signature.
+ */
+void HostRead_SetupVerify(const lba_t    lba,
+                          const uint32_t sectorCount,
+                          const uint32_t cmdContainerId,
+                          const dataCmdDesc_t *pCmd,
+                          const bool last)
+{
+    const lba_t lpa = LBA2LPA(lba);
+    ploc_t      ploc;                               // physical location of LPA
+
+    WCM_HostReadCollisionPolicy(lpa, DONT_REUSE_CACHESLOT);
+
+    // Perform indirection lookup to get band/offset location
+    L2P_GetBandLocation(lpa, &ploc);
+#if RAMDISK_BUILD
+    if (InitState_IsDiscoveryDone())
+#else  // RAMDISK_BUILD
+    if (InitState_IsLogicalEnabled())
+#endif // RAMDISK_BUILD
+    {
+        if (PLOC_IsInMedia(ploc))
+        {
+            if (IsVerifyErrorCmdReadVerify())
+            {
+                DispatchRead_NonPerf(lba, sectorCount, ploc, cmdContainerId, HOST_READ_VERIFY);
+            }
+            else
+            {
+                // Read Verify for self-test scans
+                DispatchRead_NonPerf(lba, sectorCount, ploc, cmdContainerId, HOST_READ_SELF_TEST_VERIFY);
+            }
+        }
+        else
+        {
+            // Data is not on NAND, so the read verify will be 'ok' - no need to do anything
+        }
+    } //ENDIF: Logical State enabled
+}
+
+#if !ENABLE_CMI_READ_PATH
+// For Read Verify commands issued by the host
+REGISTER_CALLBACK(CallBack_NAND_Work_HostRead_Verify, HostRead_VerifyNandWorkCallback);
+// For Read Verify commands issued by self-test scans
+REGISTER_CALLBACK(CallBack_NAND_Work_DstRead_Verify, HostRead_VerifyNandWorkCallback);
+#endif // !ENABLE_CMI_READ_PATH
+/**
+ * Nand work callback to complete read verify command.
+ *
+ * @param workID The nand work item identifier for the completed read.
+ */
+void HostRead_VerifyNandWorkCallback(uint32_t workID)
+{
+#if !ENABLE_CMI_READ_PATH
+    uint32_t            buffIndex        = Nand_Work_GetBufferPtrA_hf(workID);
+    uint32_t            sectors          = Nand_Work_GetTotalCount(workID);
+    uint32_t            containerId      = Nand_Work_GetContainer(workID);
+    NandAddr_t          nandAddr         = Nand_Work_GetAddressA_hf(workID);
+
+    WCM_VerifyReadLba(workID);
+
+    ReadVerifyCallback(buffIndex, sectors, containerId, nandAddr);
+
+    Nand_Work_PutEntry(workID);
+#endif // !ENABLE_CMI_READ_PATH
+}
+
+#if ENABLE_CMI_READ_PATH
+/**
+ * CMI Read callback to complete verify command.
+ *
+ * @param header Pointer to CMI message header.
+ * @param context Contextual data for the CMI message
+ */
+void HostRead_VerifyCmiCallback(cmiMsgHeader_t *header, contextData_t *context)
+{
+    cmiReadMessage_t *readMessage;
+
+    readMessage = CMI_Downstream_GetReadMessageHandle(header);
+    ASSERT(readMessage != NULL); /// ASSERT_CI281: Unable to get read message handle for CMI message header
+
+    ReadVerifyCallback(
+            readMessage->bufferOffset, 
+            readMessage->numberOfSectors, 
+            CoreMediaIfc_GetContainerId(context), 
+            readMessage->physicalAddress);
+
+    CoreMediaIfc_ClearCmiContextInformation(header->msgid);
+}
+#endif // ENABLE_CMI_READ_PATH
+
+/**
+ * Common callback to complete verify commands.
+ *
+ * @param   buffIndex   Transfer buffer destination for data.
+ * @param   sectors     Number of sectors read.
+ * @param   containerId Container id associated with read command.
+ * @param   nandAddr    Nand address the read targeted.
+ */
+void ReadVerifyCallback(const uint32_t buffIndex, const uint32_t sectors, const uint32_t containerId, const NandAddr_t nandAddr)
+{
+    dataCmdDesc_t      *pCmd;
+    uint32_t            currSector;
+#if !HOST_SATA     
+    uint32_t            checkCRC;
+    uint32_t            forcedCrcErrorType;
+#endif // !HOST_SATA     
+#if ENABLE_HITACHI_TRANSPORT
+    uint32_t            uec = UEC_CMD_DONE;
+#else // ENABLE_HITACHI_TRANSPORT
+ #if !HOST_SATA     
+    uint32_t            stompedData, i;
+    uint32_t            lbaOffset, crcOffset, tbSectorOffset;
+    bool                fUncorr = false;
+    unsigned            lbaBitIndex;
+ #endif // !HOST_SATA    
+#endif // ENABLE_HITACHI_TRANSPORT
+#if HOST_SATA
+    tbufLba_t           tokenValue;
+    wuncOptions_e       uncType;
+#endif // HOST_SATA
+
+    pCmd = DataCmdDesc_GetPtr(Work_Container_GetCallBackContext(containerId));
+
+#if HOST_SAS
+    CmdQ_HostRead_IncrementReadyForXport(sectors);
+    for (currSector = 0; currSector < sectors; currSector++)
+    {
+        DataCmdDesc_SetLba(pCmd, (lba_t)Tbuf_GetBufferLBA(buffIndex + currSector));
+        checkCRC      = Tbuf_GetBufferCRC(buffIndex + currSector);
+        checkCRC     ^= DataCmdDesc_GetLba(pCmd) & NULL32; // LbaLow
+ #if ENABLE_8_BYTE_LBAS
+        checkCRC     ^= ((DataCmdDesc_GetLba(pCmd) >> 32) & NULL16); // LbaHigh
+ #endif // ENABLE_8_BYTE_LBAS
+
+        // Check for stomped CRC
+        if (FORCED_ERROR_CRC == (checkCRC & ~FORCED_ERROR_CRC_SUBMASK))
+        {
+            forcedCrcErrorType = checkCRC & FORCED_ERROR_CRC_SUBMASK;
+            switch (forcedCrcErrorType)
+            {
+                case NAND_CRC_ERROR_FLAG:
+                case NAND_CRC_BKGD_ERROR_FLAG:
+                    uec = UEC_MEDIA_HARD_UNCORRECTABLE;
+                    break;
+                default:
+                    uec = UEC_CMD_DONE;
+                    break;
+            }
+        }
+        else
+        {
+            uec = UEC_CMD_DONE;
+        }
+    }
+
+    CM_FreeHostReadBuffer(buffIndex, sectors);
+    CmdQ_HostRead_DecrementReadyForXport(sectors);
+    Work_Container_DecCount(containerId, sectors);
+
+    if (Work_Container_IsAllWorkDone(containerId))
+    {
+        Work_Container_PutEntry(containerId);
+        CmdQ_DataCmdDone(pCmd, true);
+
+        // Clear COMPLETION_INT bit in mailbox
+        MB_Handler_DataCmdDone(pCmd, uec);
+    }
+#else // HOST_SAS
+    // Copying the same bookkeeping as the normal reads for consistency
+    WCM_SetValid(buffIndex, sectors);
+    CmdQ_HostRead_IncrementReadyForXport(sectors);
+
+    // don't bother looking for another error if already in error and command is read verify
+#if HOST_SATA
+    if (    !DataCmdDesc_IsError(pCmd)
+ #if ENABLE_8_BYTE_LBAS
+            && pCmd->ReadVerify
+ #else // ENABLE_8_BYTE_LBAS
+            && IsVerifyErrorCmdReadVerify()
+ #endif // ENABLE_8_BYTE_LBAS
+        )
+#else // HOST_SATA
+    if (!(DataCmdDesc_IsError(pCmd) && IsVerifyErrorCmdReadVerify()))
+#endif // HOST_SATA
+    {
+        //
+        // Walk thru all the data and look for any stomped CRCs due to write uncorrectable or other
+        // error scenario (like ECC fatal during defrag) that won't show up as a NAND work item
+        // error.
+        //
+#if HOST_SATA
+        for (currSector = 0; currSector < sectors; currSector++)
+        {
+            // Get the token value from LBA
+            tokenValue = Tbuf_GetBufferLbaToken(buffIndex+currSector);
+
+            // Check for uncorrectable token
+            if (LBA_TOKEN_UNCORRECTABLE == tokenValue)
+            {
+                // Get the first Dword from the sector data to know the unc error type
+                switch (Tbuf_GetBufferSectorDword(buffIndex+currSector, 0))
+                {
+                    case FORCED_ERROR_DATA_WU_NOLOGERROR:
+                        uncType = WU_NO_LOG_ERROR;
+                        break;
+                    case FORCED_ERROR_DATA_WU_DOLOGERROR:
+                        uncType = WU_DO_LOG_ERROR;
+                        break;
+                    case FORCED_ERROR_DATA_XOR_FAILURE:
+                        uncType = NAND_CRC_ERROR_FLAG;
+                        break;
+                    default:
+                        uncType = WU_INVALID;
+                        break;
+                }
+
+                if (WU_INVALID != uncType)
+                {
+                    // Found our first error
+                    DataCmdDesc_SetError(pCmd, true);
+                    DataCmdDesc_SetUncErrorType(pCmd, uncType);
+                    // Read Verify in SATA expects us to return the LBA of the first uncorrectable error
+                    // Adjust the data command so that LBA value is used when sending status back
+                    DataCmdDesc_SetLba(pCmd, (lba_t)Tbuf_GetBufferLBA(buffIndex+currSector));
+                }
+                break; // Found an error, stop checking sectors and make sure this LBA gets reported
+            } // ENDIF: UNC token found
+        } // ENDFOR: step thru the sectors
+#else // HOST_SATA
+
+        lbaOffset = Tbuf_GetBufferLbaOffset();
+        crcOffset = Tbuf_GetBufferCrcOffset();
+
+        for (currSector = 0; currSector < sectors; currSector++)
+        {
+            // Get LBA and CRC from tbuf
+            tbSectorOffset = Tbuf_GetSectorOffset(buffIndex + currSector);
+            DataCmdDesc_SetLba(pCmd, Tbuf_GetBufferDwordNoFlush(tbSectorOffset + lbaOffset));
+            checkCRC       = Tbuf_GetBufferDwordNoFlush(tbSectorOffset + crcOffset);
+            //decode CRC from LBA (only lower 32 bit of LBA are CRCed in SATA T2)
+            checkCRC     ^= DataCmdDesc_GetLba(pCmd) & NULL32; // LbaLow
+            //checkCRC     ^= ((DataCmdDesc_GetLba(pCmd) >> 32) & NULL16); // LbaHigh
+
+            // Check for stomped CRC
+            if (FORCED_ERROR_CRC == (checkCRC & ~FORCED_ERROR_CRC_SUBMASK))
+            {
+                fUncorr = true;
+                forcedCrcErrorType = checkCRC & FORCED_ERROR_CRC_SUBMASK;
+                switch (forcedCrcErrorType)
+                {
+                    case WU_NO_LOG_ERROR:
+                        stompedData = FORCED_ERROR_DATA_WU_NOLOGERROR;
+                        break;
+                    case WU_DO_LOG_ERROR:
+                        stompedData = FORCED_ERROR_DATA_WU_DOLOGERROR;
+                        break;
+                    case NAND_CRC_ERROR_FLAG:
+                        stompedData = FORCED_ERROR_DATA_XOR_FAILURE;
+                        break;
+                    default:
+                        fUncorr = false;
+                        break;
+                }
+
+                if (fUncorr)
+                {
+                    // Check for a CRC colliding with the stomp value
+                    for (i=0; i<(MediaFormat_GetUserSectorSizeNoMeta()>>2); i++)
+                    {
+                        if(stompedData != Tbuf_GetBufferSectorDword(buffIndex+currSector, i))
+                        {
+                            fUncorr = false; //data did not match specific unc pattern
+                            break;
+                        }
+                    }
+                }
+
+                if (fUncorr)
+                {
+                    // Found our first error
+                    DataCmdDesc_SetError(pCmd, true);
+                    // Bit index of the current LBA
+                    lbaBitIndex = (uint32_t) (DataCmdDesc_GetLba(pCmd) % MAX_SECTORS_PER_SCAN_CHECK);
+                    gVerifyError.errorLbaBitMask[lbaBitIndex / BIT_ARRAY_PER_DWORD_SIZE] |= (1 << (lbaBitIndex % BIT_ARRAY_PER_DWORD_SIZE));
+
+                    if (IsVerifyErrorCmdReadVerify())
+                    {
+                        /// @todo this will be used only in SATA. Jonathan has alternate solution in works.
+
+                        // Hijack unused high LBA for type of uncorrectable error
+                        DataCmdDesc_SetLbaHigh(pCmd, (uint16_t)(checkCRC & FORCED_ERROR_CRC_SUBMASK));
+                        break;
+                    }
+                }
+            } // ENDIF: stomped CRC found
+        } // ENDFOR: step thru the sectors
+#endif // HOST_SATA
+    } // ENDIF: no errors, yet
+
+    // Copying the same bookkeeping as the normal reads for consistency
+    CM_FreeHostReadBuffer(buffIndex, sectors);
+    CmdQ_HostRead_DecrementReadyForXport(sectors);
+    Work_Container_DecCount(containerId, sectors);
+
+    if (Work_Container_IsAllWorkDone(containerId))
+    {
+        CallBack_ContainerfptrArray[Work_Container_GetCallback(containerId)](containerId);
+    }
+
+#endif // !HOST_SAS
+
+    Band_DecrementReadCount(nandAddr);
+}
+
+/**
+ * Dispatch a single nand read for host lba that does not require performance path.
+ *
+ * @param   lba             Starting LBA for read.
+ * @param   sectorCount     Total sectors to read.
+ * @param   bandLocation    Physical location of IU on nand.
+ * @param   cmdContainerId  Container id associated with read command.
+ * @param   reason          Reason for dispatching the non-performance read (affects callback).
+ */
+void DispatchRead_NonPerf(const lba_t          lba,
+                          const uint32_t       sectorCount,
+                          const ploc_t         bandLocation,
+                          const uint32_t       cmdContainerId,
+                          const slowFillReason_e reason) 
+{
+    uint32_t    bfridx;                             // transfer buffer sector offset for read destination
+    NandAddr_t  nandAddr[MAX_PAGES_SPANNED_BY_LPA]; // nand address for IU
+    Length_t    lpaSplit;                           // number of sectors for IU on each page
+    uint32_t    totalPages;                         // total pages IU is written to (may be 2 for VSS)
+
+    // Increment how many sectors we're going to read
+    Work_Container_IncCount(cmdContainerId, sectorCount);
+
+    // Not a zero transfer and data is in NAND
+    bfridx     = WCM_AllocateHostReadBuffer(sectorCount);
+    totalPages = L2P_GetNandAddressToLbaOffset(bandLocation, &nandAddr[0], &lpaSplit, LBA2IUOFFSET(lba));
+    CmdQ_HostRead_IncrementAllocated(sectorCount);
+
+    HostReadSlowBufferFill(
+            nandAddr[0],
+            bfridx,
+            sectorCount,
+            reason,
+            lba,
+            cmdContainerId);
+
+    if (ReadDisturb_DoWeRelocate(NandAddr_GetEb(nandAddr[0]), NandAddr_GetDie(nandAddr[0]), lba, totalPages))
+    {
+        ReadDisturb_Relocate(NandAddr_GetEb(nandAddr[0]), lba);
+    }
+}
+
+#pragma ghs section
+
+/**
+ * Handles read calculations around first IU read in request and prepares for sequential search.
+ *
+ * @param   startLba        Start LBA for read request.
+ * @param   count           Size (in sectors) of read request.
+ * @param   bandLocation    Band location associated with start Lba.
+ * @param   nandAddr        Pointer to nand address array to fill out with page locations for read source.
+ * @param   pageLen         Pointer to page length array to fill out sectors to read for first IU.
+ * @param   totalPages      Pointer to caller variable tracking total pages required to do entire
+ *                          sequential read.
+ *
+ * @return  Max number of sectors to attempt to read.
+ *
+ * @note    Helper function for HostRead_SequentialSearch(), not meant to be called elsewhere.
+ *          
+ *          Deals with extra logic to handle spanning IU. Determines correct nand address (or addresses for
+ *          spanning IU). Ensures bandLocation is accurate (pointing to most recent page and IU offset) for
+ *          start of search Ensures accurate calculation of sectorsToEndOfPage for current page being searched.
+ */
+INLINE_PERF uint32_t CalculateFirstIuRead(const lba_t       startLba,
+                                          const uint32_t    count, 
+                                          ploc_t           *bandLocation,
+                                          NandAddr_t       *nandAddr,
+                                          LengthPageRead_t *pageLen,
+                                          uint32_t         *totalPages)
+{
+    Length_t lpaSplit;                  // sectors on each page for starting IU
+    uint32_t pageOffset;                // sector offset in page for startLba
+    uint32_t requestCount;              // cap on sector to check for sequential read
+    const uint32_t sectorsPerPage = CoreConfig_GetConfiguredSectorsPerPage();
+
+    // calculate starting page offset for initial LBA
+    pageOffset  = (L2P_GetSectorOffsetFromBandLocation(bandLocation) + LBA2IUOFFSET(startLba));
+    *totalPages = L2P_GetNandAddressToLbaOffset(*bandLocation, nandAddr, &lpaSplit, LBA2IUOFFSET(startLba));
+
+    if (pageOffset >= sectorsPerPage)
+    {
+        // IU spanned and start LBA occurred on 2nd page, no need to read 1st page
+        // nandAddr and lpaSplit have already been updated in L2P_GetNandAddressToLbaOffset() to discard first page
+        // bandLocation is NOT updated, so need to adjust it to correct nand address
+        ASSERT(*totalPages == 1);                   /// ASSERT_CI197: Expect L2P_GetNandAddressToLbaOffset() to calculate correctly
+
+        pageOffset -= sectorsPerPage;
+    }
+
+    // multiple (MAX_READ_PAGES) pages can be dispatched at once.
+    // A max cap is provided here, but different callers have different dispatch paths that may further restrict max number of pages.
+    // Caller should truncate count accordingly to avoid wasting cycles walking too far.
+    requestCount = MIN(count, (MAX_READ_PAGES * sectorsPerPage) - pageOffset);
+
+    if ((*totalPages > 1) && (lpaSplit.PageCount[0] < requestCount))
+    {
+        // initial IU spans and both pages are needed
+        pageLen[0]  = lpaSplit.PageCount[0];              // 1st page len must be accurate
+        pageLen[1]  = (LengthPageRead_t)sectorsPerPage;   // assume 2nd page len goes to end of page (final page will be truncated in sequential search)
+    }
+    else
+    {
+        // initial IU only requires a single page read
+        *totalPages = 1;                                         // next possible nandAddr is on the 2nd page
+        pageLen[0]  = (uint8_t)(sectorsPerPage - pageOffset);    // assume page len goes to end of page (final page will be truncated in sequential search)
+    }
+
+    return requestCount;
+}
+
+/**
+ * Handles adjustments to final page read.
+ *
+ * @param   count                   Final size (in sectors) that will be read, already truncated for
+ *                                  sequentially or requestSize.
+ * @param   sectorCountOnNewPage    Count of sectors for final IU falling on new page (if applicable).
+ *                                  INDIRECTION_GRANULARITY if entire IU, otherwise number of sectors that
+ *                                  spanned.
+ * @param   bandLocation            Band location associated with last IU.  If IU spans may need to advance
+ *                                  forward to next page.
+ * @param   nandAddr                Pointer to nand address array to fill out with page locations for final
+ *                                  read (if necessary).
+ * @param   pageLen                 Pointer to page length array to fill out sectors to read for final page.
+ * @param   totalPages              Pointer to caller variable tracking total pages required to do entire
+ *                                  sequential read.
+ *
+ * @note    Helper function for HostRead_SequentialSearch(), not meant to be called elsewhere.
+ *          
+ *          If any part of the final IU read falls on a new page, need to add it to the list to read. Also need
+ *          to calculate the correct sectors to read (pageLen) for final page.
+ */
+INLINE_PERF void CalculateLastPageRead(const uint32_t    count,
+                                       const uint32_t    sectorCountOnNewPage,
+                                       ploc_t           *bandLocation,
+                                       NandAddr_t       *nandAddr,
+                                       LengthPageRead_t *pageLen,
+                                       uint32_t         *totalPages)
+{
+    uint32_t sectorsOnLastPage;             // number of sectors on last page to be read
+    int32_t  totalSectorsAlignedToPages;    // calculate number of sectors to determine if additional page read is required
+    const uint32_t sectorsPerPage = CoreConfig_GetConfiguredSectorsPerPage();
+
+    // calculate sectors on 1st page + remaining (all full) pages
+    // to determine if another page read is required to meet seqCount length.
+    // name is a slight misnomer as it must include 1st page sectors which may not align to a page.
+    totalSectorsAlignedToPages = (pageLen[0] + (sectorsPerPage * ((*totalPages) - 1)));
+
+    // Enable for extra debug
+    // NLog_Hfr_5("CalculateLastPageRead seqCount %d, newPage %d, totalPage %d, addr %d (%d)\n", count, sectorCountOnNewPage, *totalPages, nandAddr[0].address, nandAddr[1].address);
+
+    if (count > totalSectorsAlignedToPages)
+    {
+        // current pages being read doesn't meet seqCount.
+        // Expect a single (possibly partial) IU on new page that needs to be read.
+        ASSERT((count - totalSectorsAlignedToPages) <= INDIRECTION_GRANULARITY);     /// ASSERT_CI198: A new page should only be needed for at most 1 IU
+
+        L2P_AdvanceBandLocation(bandLocation);
+        nandAddr[*totalPages] = L2P_GetNandAddressWithAdjustedSector(*bandLocation, 0);
+        (*totalPages)++;
+    }
+
+    // now adjust pageLen for final page
+    // sectors on last page = count - (sectors on 1st page) - (pages to read up UNTIL last)
+    // if count aligns to end of page, this math will make sectorsOnLastPage = 0 instead of sectorsPerPage.  Range is [0, sectorsPerPage)
+    if (count > pageLen[0])
+    {
+        // request goes past first page
+        ASSERT(*totalPages > 1);           /// ASSERT_CI199: Expected a multi page read
+        
+        sectorsOnLastPage = (count - pageLen[0]);
+
+        if (*totalPages > 2)        // ignore 1st page and last page
+        {
+            sectorsOnLastPage -= (sectorsPerPage * (*totalPages - 2));
+        }
+
+        pageLen[(*totalPages) - 1] = (LengthPageRead_t)sectorsOnLastPage;
+    }
+    else
+    {
+        // request doesn't go past 1st page
+        pageLen[0] = (LengthPageRead_t)count;
+        *totalPages = 1;
+    }
+}
+
+/**
+ * If read must be truncated after calculating, adjust read variables.
+ *
+ * @param   sectorsToRemove Sector count to remove from read (newIndCount - indCount)
+ * @param   pageLen         Pointer to page length array to fill out sectors to read for each nandAddr.
+ * @param   totalPages      Pointer to caller variable tracking total pages required to do entire
+ *                          sequential read.
+ */
+void TruncateRead(const uint32_t sectorsToRemove, LengthPageRead_t *pageLen, uint32_t *totalPages)
+{
+    if (pageLen[*totalPages-1] > sectorsToRemove)
+    {
+        // last page to read was shortened
+        pageLen[*totalPages-1] -= sectorsToRemove;
+    }
+    else
+    {
+        // shortening removed the final page and (might) eat into new last page
+        ASSERT(*totalPages > 1);        /// ASSERT_CI196: Expected at least 2 pages to read
+
+        (*totalPages)--;
+        pageLen[*totalPages-1] -= (sectorsToRemove - pageLen[*totalPages]);
+    }
+}
+
+/**
+ * For read requests that can handle multiple IUs and possibly multiple nand pages, determines optimum
+ * nand read size and populates structures required for the read. Needs to process collisions on write
+ * streams so we can service requested reads.
+ *
+ * @param   startLba    Starting LPA to search for sequential.
+ * @param   count       Number of sector reads we are trying to service.  Caller should truncate count to
+ *                      what it can process to avoid wasting cycles walking too far.
+ * @param   nandAddr    Pointer to nand address array to fill out with page locations for read source.
+ * @param   pageLen     Pointer to page length array to fill out sectors to read for each nandAddr.
+ * @param   totalPages  Pointer to caller variable tracking total pages required to do entire sequential
+ *                      read.
+ *
+ * @return  The amount of reads we can service.
+ */
+uint32_t HostRead_SequentialSearch(const lba_t       startLba, 
+                                   const uint32_t    count, 
+                                   NandAddr_t       *nandAddr,
+                                   LengthPageRead_t *pageLen,
+                                   uint32_t         *totalPages)
+{
+#if (!RAMDISK_BUILD)
+    ploc_t   l2pBandLoc;                // band location to be updated via L2P lookup
+    ploc_t   seqBandLoc;                // band location to be rolled forward manually (i.e. no L2P lookup)
+    lba_t    searchLpa;                 // current LPA to check for continued sequential.
+    NandAddr_t tmpNandAddr;             // temporary nand address required to compare 2nd page of spanning IUs
+    uint32_t seqCount;                  // track sector count that can be read sequentially
+    uint32_t requestCount;              // cap on sector to check for sequential read
+    uint32_t sectorCountOnNewPage = 0;  // set > 0 when page transition occurs during walk
+    const uint32_t sectorsPerPage = CoreConfig_GetConfiguredSectorsPerPage();
+
+    // Get the physical band location from the indirection system
+    L2P_GetBandLocation(startLba, &seqBandLoc);      // using seqBandLoc here as an optimization (may do initial advance below)
+
+    // Check if this LBA is on the media or if it is zero content
+    if (false == PLOC_IsInMedia(seqBandLoc))
+    {
+        return 0;           // initial IU isn't on media, return 0 to denote nothing to read
+    }
+
+    // handle first IU
+    requestCount = CalculateFirstIuRead(startLba, count, &seqBandLoc, nandAddr, pageLen, totalPages);
+
+    // now prepare for reading ahead (if caller requested a large enough count to read more than 1 IU)
+
+    // seqCount keeps track of the ACTUAL sector count that we will be able to read sequentially
+    // need to create accurate start count (already know we're reading from start LBA to end of start IU)
+    seqCount     = (INDIRECTION_GRANULARITY - LBA2IUOFFSET(startLba));
+    searchLpa    = (LBA2LPA(startLba) + INDIRECTION_GRANULARITY);          // LPA after 1st
+
+    NLog_Host_4("HostRead_SequentialSearch: startLba 0x%lx count %d requestCount %d\n", PARAM64(startLba), count, requestCount); 
+
+    // At this point all nand addresses for first IU (including spanning IU cases), are handled.
+    // There may be a 2nd page read already being tracked for spanning IU case.
+    // This is problematic, because transitioning to the next IU will be considered a page transition
+    // and will trigger adding a new nandAddr (that matches the last nandAddr) in the loop below.
+    //
+    // There is one other corner case that needs to be handled:
+    // If the starting IU spanned and startLba fell on the 2nd page the 1st nand address will have been appropriately discarded
+    // (by copying nandAddr[1] contents over nandAddr[0] and adjusting the .offset field to point to startLba).
+    // This is the same problem as above, except that we also need to ensure correct .offset is tracked.
+    // 
+    // Solution: For IUs following a spanning IU, add an extra check to skip adding a new nandAddr if it matches the last one.
+
+    while (seqCount < requestCount)
+    {
+        // now find actual band location for next sequential LBA (i.e. use L2P)
+        if (CollisionChecker_IsIuReserved(searchLpa))
+        {
+            // do collision handling policy so read can be serviced
+            WCM_HostReadCollisionPolicy(LBA2LPA(searchLpa), DONT_REUSE_CACHESLOT);
+        }
+
+        L2P_GetBandLocation(searchLpa, &l2pBandLoc);
+       
+        // advance band location by walking forward to next IU position on band (i.e. no L2P)
+        sectorCountOnNewPage = L2P_AdvanceBandLocation(&seqBandLoc);
+
+        // if band locations match, last and current searchLpa must be sequential on nand
+        if (l2pBandLoc.ploc != seqBandLoc.ploc)
+        {
+            break;
+        }
+
+        // if a page transition has occurred, need to track the new nandAddr
+
+        if (sectorCountOnNewPage == INDIRECTION_GRANULARITY)
+        {
+            // this is the first complete IU on a new page and need to track the address.
+            // INDIRECTION_GRANULARITY indicates it starts on sector 0
+            
+            nandAddr[*totalPages] = L2P_GetNandAddressWithAdjustedSector(seqBandLoc, 0);
+            pageLen[*totalPages] = (LengthPageRead_t)sectorsPerPage;
+            (*totalPages)++;
+            // Enable for extra debug
+            // NLog_Hfr_6("advance %d (%d), newPage %d, seqCount %d, lba 0x%lx\n", nandAddr[*totalPages-2].address, nandAddr[*totalPages-1].address, sectorCountOnNewPage, seqCount, PARAM64(searchLpa));
+        }
+
+        else if (sectorCountOnNewPage > 0)
+        {
+            // this is the first complete IU on a new page and need to track the address.
+            // a non-zero value indicates previous IU spanned.
+            
+            tmpNandAddr = L2P_GetNandAddressWithAdjustedSector(seqBandLoc, 0);
+
+            // this check handles corner case behavior with 1st IU read.
+            // For the 1st IU only, the 2nd page is already being tracked and don't want to add it again.
+            if (NandAddr_GetEb(tmpNandAddr) != NandAddr_GetEb(nandAddr[*totalPages - 1]))
+            {
+                nandAddr[*totalPages] = tmpNandAddr;
+                pageLen[*totalPages] = (LengthPageRead_t)sectorsPerPage;
+                (*totalPages)++;
+                // Enable for extra debug
+                // NLog_Hfr_6("advance %d (%d), newPage %d, seqCount %d, lba 0x%lx\n", nandAddr[*totalPages-2].address, nandAddr[*totalPages-1].address, sectorCountOnNewPage, seqCount, PARAM64(searchLpa));
+            }
+        }
+
+        searchLpa += INDIRECTION_GRANULARITY;
+        seqCount  += INDIRECTION_GRANULARITY;
+    }
+
+    // done searching ahead, do any necessary adjustment to final nandAddr and pageLen
+
+    // reads to service can't exceed requestCount
+    seqCount = MIN(seqCount, requestCount);
+    
+    // if any part of final IU fell on new page, need to add it to the list of pages to read
+    // also, final page read needs to have correct pageLen set.
+    CalculateLastPageRead(seqCount, sectorCountOnNewPage, &seqBandLoc, nandAddr, pageLen, totalPages);
+
+    return seqCount;
+
+#else //(!RAMDISK_BUILD)
+    
+    ploc_t   l2pBandLoc;                // band location to be updated via L2P lookup
+    lba_t    searchLpa;                 // current LPA to check for continued sequentiality
+    uint32_t seqCount;                  // track sector count that can be read sequentially
+    const uint32_t sectorsPerPage = CoreConfig_GetConfiguredSectorsPerPage();
+    const uint32_t requestCount   = MIN(count, sectorsPerPage);
+
+    L2P_GetBandLocation(currLBA, &l2pBandLoc);
+
+    // Check if this LBA is on the media or if it is zero content
+    if (false == PLOC_IsInMedia(seqBandLoc))
+    {
+        return 0;           // initial IU isn't on media, return 0 to denote nothing to read
+    }
+
+    seqCount  = (INDIRECTION_GRANULARITY - LBA2IUOFFSET(startLba));
+    searchLpa = (LBA2LPA(startLba) + INDIRECTION_GRANULARITY);          // LPA after 1st
+
+    while(PLOC_IsInMedia(l2pBandLoc) && (seqCount < requestCount))
+    {
+        if(CollisionChecker_IsIuReserved(searchLpa))
+        {
+            WCM_HostReadCollisionPolicy(LBA2LPA(searchLpa), DONT_REUSE_CACHESLOT);
+        }
+
+        seqCount += INDIRECTION_GRANULARITY;
+        searchLpa += INDIRECTION_GRANULARITY;
+        //search the next sequential LBA
+        L2P_GetBandLocation(searchLpa, &tempBandLoc);
+    }
+
+    *totalPages = DIVIDE_CEILING(requestCount, sectorsPerPage);
+    return seqCount;
+#endif //(!RAMDISK_BUILD)
+}
+
+/**
+ * For zero content read requests determines maximum zero read size.
+ * Needs to process collisions on write streams so we can service requested reads.
+ *
+ * @note Assumes caller has already determined first IU is a zero read IU
+ *
+ * @param startLba     Starting LPA to search for sequential.
+ * @param count        Number of sector reads we are trying to service.
+ *
+ * @return The amount of reads we can service.
+ */
+uint32_t HostRead_Zero_SequentialSearch(const lba_t startLba, const uint32_t count)
+{
+    ploc_t   bandLocation;              // band location to be updated via L2P lookup
+    lba_t    searchLpa;                 // current LPA to check for continued sequential
+    uint32_t seqCount;                  // track sector count that can be read sequentially
+    uint32_t requestCount;              // cap on sector to check for sequential read
+
+#if ENABLE_HMI_TOKEN_0
+    uint32_t zeroDataBuffSize;          // size of zero data buffer (in sectors).  May be zero.
+    zeroDataBuffSize = GetReadZeroDataBuffSizeSectors();
+    // We have 1 reserved BE space reserved in the TxBuf SRAM for zero data
+    // the index is available in gZeroDataIdx
+    /// @todo Once we have TLM up and running, we have to change this to use Tlm_SetTllLink(zeroFillSector, zeroFillSector)
+    ///       So we don't need to waste one reserved BE; just 1 sector will be enough for ZeroContent
+    // Note zeroDataBuffSize may be zero.  This is ok, just means we don't want to continue requesting past 1st IU.
+    requestCount = MIN(count, MAX(zeroDataBuffSize, INDIRECTION_GRANULARITY));
+#else  // ENABLE_HMI_TOKEN_0
+    requestCount = MIN(count, MAX_DESCRIPTOR_SIZE);
+#endif // ENABLE_HMI_TOKEN_0
+
+    seqCount  = (INDIRECTION_GRANULARITY - LBA2IUOFFSET(startLba));
+    searchLpa = (LBA2LPA(startLba) + INDIRECTION_GRANULARITY);
+
+    // accumulate as many zero read sectors as possible
+    while (seqCount < requestCount)
+    {
+        if (CollisionChecker_IsIuReserved(searchLpa))
+        {
+            WCM_HostReadCollisionPolicy(searchLpa, DONT_REUSE_CACHESLOT);    // apply collision policy to end of host read request
+            break;
+        }
+
+        L2P_GetBandLocation(searchLpa, &bandLocation);
+
+        if (true == PLOC_IsInMedia(bandLocation))
+        {
+            break;      // data is no longer zero read
+        }
+
+        seqCount  += INDIRECTION_GRANULARITY;
+        searchLpa += INDIRECTION_GRANULARITY;
+
+    }
+
+    // truncate count if it went past request
+    if (seqCount > requestCount)
+    {
+        seqCount = requestCount;
+    }
+
+    // enable Nlog for detailed debug
+    // NLog_Hfr_5("HostRead_Zero_SequentialSearch(): currLBA 0x%lx requested %d (capped at %d) indCount %d\n", PARAM64(startLba), count, requestCount, seqCount);
+
+    return seqCount;
+}
+
+/**
+ * Generic read dispatcher, less optimized but can handle any read.
+ * 
+ * This is the "generic" work dispatcher for fast path read commands with ENABLE_PAGE_ALIGNED_READS true.
+ * This routine sets up DMA descriptors for a given read request, and dispatches necessary NAND work for a
+ * given LBA and sectorCount taking nonmapping and NAND page contiguity into account. This routine breaks
+ * up the read request optimally for NAND accesses giving precedence to NAND page wide reads when
+ * possible. This routine can handle all possible sectorCount requests (sub IU, IU aligned, and IU
+ * nonaligned), and dispatches NAND work on a page alignment wherever possible. Typically however, this
+ * routine is only leveraged for IU nonaligned read requests since optimal paths exist for 4K, 8K, and
+ * multiple 4K (exceeding 8K or non NAND) requests.
+ *
+ * @param   cmdLba          Original read LBA requested by host (pCmd)
+ * @param   hostLba         Needed for skip read support. I'd provide more detail if anything was commented
+ *                          in skip read code to clarify what it's doing. Set to HostLBA for non-skip use.
+ * @param   sectorCount     Sectors to transfer starting from HostLBA.
+ * @param   containerId     Work container to attach to transfers.
+ * @param   pCmd            Data cmd descriptor to provide details for DMA.
+ * @param   sectorOffsetAdj Sector offset adjustment used by SAS code only.
+ * @param   lastCmdSegment  Only applies to skip commands. Indicates this is the last DMA setup for the command
+ * @param   dispatchSingleDmaXferPair DMA descriptor with only one xfer pair
+ *
+ * @note    This routine is also geared to handle read commands which may have been preprocessed by read
+ *          prefetch (ie when read requests have been partially returned) by taking the passed pCmd LBA into
+ *          account, not just the passed hostLba, during DMA offset calculation.
+ * @note    differs from HostRead_FastTransfer() in 
+ *           - a) support for read disturb if currLBA is a spanning IU
+ *           - b) uses generic dispatch (fast only handles 2 pages max)
+ */
+void HostRead_SetupHostTransfer(const lba_t          cmdLba,
+                                const lba_t          hostLba,
+                                const uint32_t       sectorCount,
+                                const uint32_t       containerId,
+                                const dataCmdDesc_t *pCmd,
+                                const uint32_t       sectorOffsetAdj,
+                                const cmdSegment_e   lastCmdSegment,
+                                const bool           dispatchSingleDmaXferPair)
+{
+#if ENABLE_PAGE_ALIGNED_READS
+    lba_t               currLBA;
+    uint32_t            sectorsRemaining;
+#if ENABLE_POST_DMA_ON_HOST_STRIPE_BOUNDARY
+    uint32_t            sectorsToStripeBoundary;
+#endif
+    uint32_t            indCount;
+    uint32_t            bfridx;
+    uint32_t            totalPages;
+    NandAddr_t          nandAddr[MAX_READ_PAGES];  // nand address for each page of nand read
+    LengthPageRead_t    pageLen[MAX_READ_PAGES];   // sectors to read for each page of nand read
+    bool                readDisturb = false;
+
+#if !ENABLE_DMA_DISPATCH_PER_NAND_WORK
+    bool                flushDma  = false;
+#endif // !ENABLE_DMA_DISPATCH_PER_NAND_WORK
+
+    CmdQ_HostRead_IncrementAllocated(sectorCount);
+
+    currLBA = hostLba;
+    sectorsRemaining = sectorCount;
+    
+    //Dispatch the Read
+    while (sectorsRemaining)
+    {
+        L2P_PreLoad(currLBA);
+
+        if (gpActiveDma == NULL)
+        {
+            // Get and initialize a DMA descriptor
+            gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+            TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint32_t) (currLBA - cmdLba - sectorOffsetAdj), sectorOffsetAdj, containerId);
+        }
+
+        if (CollisionChecker_IsIuReserved(currLBA))
+        {
+            WCM_HostReadCollisionPolicy(currLBA, sectorsRemaining);
+        }
+
+#if ENABLE_POST_DMA_ON_HOST_STRIPE_BOUNDARY
+        // Aberdeen Rock Hardware "Skip" Command Workaround requires
+        // - DMA descriptor with only one xfer pair
+        // - DMA descriptor that does not cross a 'host stripe boundary'
+        if (dispatchSingleDmaXferPair)
+        {
+            sectorsToStripeBoundary = MIN(sectorsRemaining, (HOST_STRIPE_SIZE_IN_SECTORS - ((uint32_t)currLBA & HOST_STRIPE_SIZE_IN_SECTORS_MASK)));
+            indCount = HostRead_SequentialSearch(currLBA, sectorsToStripeBoundary, nandAddr, pageLen, &totalPages);
+        }
+        else
+#endif
+        {
+            indCount = HostRead_SequentialSearch(currLBA, MIN(sectorsRemaining, CMP_GetMaxReadBufferRequestSectors()), nandAddr, pageLen, &totalPages);
+        }
+
+        // Check if this LBA is on the media or if it is zero content
+#if ENABLE_TCG
+        // If Read Request to return zero return
+        if (0 == indCount || (pCmd->zeroFill))
+#else
+        if (0 == indCount)
+#endif // ENABLE_TCG
+        {
+            // zero content read
+#if ENABLE_POST_DMA_ON_HOST_STRIPE_BOUNDARY
+            // Aberdeen Rock Hardware "Skip" Command Workaround requires
+            // - DMA descriptor with only one xfer pair
+            // - DMA descriptor that does not cross a 'host stripe boundary'
+            if (dispatchSingleDmaXferPair)
+            {
+                sectorsToStripeBoundary = MIN(sectorsRemaining, (HOST_STRIPE_SIZE_IN_SECTORS - ((uint32_t)currLBA & HOST_STRIPE_SIZE_IN_SECTORS_MASK)));
+                indCount = HostRead_Zero_SequentialSearch(currLBA, sectorsToStripeBoundary);
+            }
+            else
+#endif
+            {
+                indCount = HostRead_Zero_SequentialSearch(currLBA, sectorsRemaining);
+            }
+            bfridx   = GetGlobalZeroDataIdx();
+            SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)indCount, (uint16_t)NULL_RD_CS, false);
+            Work_Container_IncCount(containerId, indCount);
+        }
+        else
+        {
+            // nand read required
+
+            if (ReadDisturb_DoWeRelocate(NandAddr_GetEb(nandAddr[0]), NandAddr_GetDie(nandAddr[0]), currLBA, totalPages))
+            {
+                readDisturb = true;
+
+#if !ENABLE_DMA_DISPATCH_PER_NAND_WORK    
+                // Make sure to post the DMA if there are not enough resources to do the read and relo
+                if (!WCM_IsReadBufferAvailable(indCount + INDIRECTION_GRANULARITY))
+                {
+                    flushDma = true;
+                }
+#endif // !ENABLE_DMA_DISPATCH_PER_NAND_WORK
+
+                // Note if there is a product with spanning IUs (one IU spans over multiple pages) then
+                // special handling needs to be implemented to only execute readDisturb
+                // when processing the last portion of the CS. See BC MLC implementation
+            }
+
+            if (TransGetDmaBuffCountFromDmaDesc(gpActiveDma) && (!WCM_IsReadBufferAvailable(indCount) || readDisturb))
+            {
+                // If we will block for buffer, make sure active DMA is dispatched
+                SendDmaDesc(pCmd);
+
+                // Get and initialize a DMA descriptor
+                gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+                TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint32_t) (currLBA - cmdLba - sectorOffsetAdj), sectorOffsetAdj, containerId);
+            }
+
+            bfridx = WCM_AllocateHostReadBuffer(indCount);
+            Work_Container_IncCount(containerId, indCount);
+
+            // Creating DmaBuffDesc and its corresponding NandWorkItem atomic.
+            SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)indCount, (uint16_t)NULL_RD_CS, false);
+
+            NLog_Hfr_8("HostRead_SetupHostTransfer: currLBA 0x%x pageOffsets %d (%d) len %d (%d) indCount %d totalPages %d bfridx 0x%x\n",
+                       (uint32_t)currLBA, NandAddr_GetOffset(nandAddr[0]), NandAddr_GetOffset(nandAddr[1]), pageLen[0], pageLen[1], indCount, totalPages, bfridx);
+            HostRead_DispatchNandReads(currLBA, cmdLba, pCmd, sectorOffsetAdj, containerId, nandAddr, pageLen, totalPages, bfridx);
+        }
+
+        //update global loop variable
+        currLBA          += indCount;
+        sectorsRemaining -= indCount;
+
+        //Dispatch the DMA descriptor
+        if ((sectorsRemaining == 0) && lastCmdSegment)
+        {
+ #if !(HOST_NVME)
+            gpActiveDma->Sector.last = true;
+ #endif // !(HOST_NVME)
+
+ #if ENABLE_HITACHI_TRANSPORT
+            // Mark this command as being fully dispatched, used as a deadlock
+            // prevention mechanism in the Hitachi transport
+            Trans_MarkAsDispatchComplete(pCmd);
+ #endif // ENABLE_HITACHI_TRANSPORT
+        }
+
+ #if ENABLE_DMA_DISPATCH_PER_NAND_WORK
+        SendDmaDesc(pCmd);
+ #else  // ENABLE_DMA_DISPATCH_PER_NAND_WORK
+        if ((sectorsRemaining == 0) ||                                               // Cmd is done
+            (TransGetDmaBuffCountFromDmaDesc(gpActiveDma) == EMBEDDED_BUFF_DESCS) || // DMA is full
+            (CmdQ_GetReadCmdsInFlight(pCmd) == 1) ||                                 // Performance improvement for QD1 reads
+            (FireAlarm_IsSouthAborted()) ||                                          // abort is in progress
+            dispatchSingleDmaXferPair ||                                                 // caller wants to dispatch DMA asap
+            flushDma)
+        {
+            SendDmaDesc(pCmd);
+            flushDma = false;
+        }
+ #endif // ENABLE_DMA_DISPATCH_PER_NAND_WORK
+
+        // Relocate the data after dispatching the media reads
+        if (readDisturb)
+        {
+            // Since we've updated the LBA earlier, make sure to relocate the original
+            ReadDisturb_Relocate(NandAddr_GetEb(nandAddr[0]), (currLBA - indCount));
+            readDisturb = false;
+        }
+
+    } //while (sectorsRemaining)
+#endif // ENABLE_PAGE_ALIGNED_READS
+}
+
+#pragma ghs CODESECTION_PERF
+/**
+ * Dispatches a nand read for up to two pages, based on request size.
+ *
+ * @param   nandAddr        Pointer to nand address array for each page of read.
+ * @param   pageLen         Pointer to length array for each page of read.
+ * @param   totalPages      Number of pages to read.
+ * @param   bfridx          destination transfer buffer sector index for nand read.
+ * @param   callbackContext callback context.
+ * @param   snapReadEnable  Indicates if snap read is enabled/disabled during dispatch.
+ * @param   isIuAligned     Indicates if the read is being done as a part of the IU aligned implementation
+ *
+ * @note    Behavior relies on HostRead_SequentialSearch() determining how far ahead to read.
+ */
+void HostFast_DispatchNandReads(const NandAddr_t       *nandAddr,
+                                const LengthPageRead_t *pageLen,
+                                const uint32_t          totalPages,
+                                uint32_t                bfridx,
+                                const uint32_t          callbackContext,
+                                snapReadEnable_e        snapReadEnable,
+                                bool                    isIuAligned)
+{
+    Band_IncrementReadCount(nandAddr[0]);
+    CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+
+    // Dispatch first read
+    HostReadBufferFill(nandAddr[0], bfridx, pageLen[0], callbackContext, snapReadEnable);
+
+    ASSERT((isIuAligned == false) || (totalPages <= 1));        /// ASSERT_CI246: Incorrect page count - Only one IU aligned transfer, and IU cannot span multiple pages
+    
+    // May not need to submit the second read if all of the work was performed on the first page.
+    if (totalPages > 1)
+    {
+        Band_IncrementReadCount(nandAddr[1]);
+        CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+
+        // Find the next buffer index
+        bfridx = WCM_WalkBuffer(bfridx, pageLen[0]);
+
+        //Dispatch second read
+        HostReadBufferFill(nandAddr[1], bfridx, pageLen[1], callbackContext, snapReadEnable);
+    }
+}
+#pragma ghs CODESECTION_PERF_END
+
+#if ENABLE_IU_ALIGNED_READS
+#pragma ghs CODESECTION_PERF
+/**
+ * Identifies and marks IUs that lie on same die, base EB and page so that they are dispatched together.
+ *
+ * This is a Nand QP/RSP hit metrics calculator used to maximize RSP hits when issuing read dispatches when
+ * data within a block is not sequentially written on Nand.
+ *
+ * This routine breaks up each block that host requested for read into IUs and determine if more than one
+ * IU fall on same die, base EB and page. If yes, the IUs are marked to be dispatched as QP/RSP reads.
+ * Else, we issue snap read. This is considering that data is no longer written sequentially on Nand with
+ * write recursion enabled. IUs are also ordered such that those located on same page are dispatched in order.
+ *
+ * @param   startLpa        Starting LPA for host read.
+ * @param   sectorCount     Count of contiguous sectors to read, starting at startLpa.
+ */
+void RspHitMetricsCalculator(lba_t startLpa, uint32_t sectorCount)
+{
+    uint32_t            i, j, maxIu;
+    uint32_t            sectorsRemaining;
+    ploc_t              bandLoc;
+    NandAddr_t          nandAddr;
+    lba_t               lpa;
+    uint32_t            iuIndex = 0;
+
+    ASSERT(IsLPA(startLpa));                                                          /// ASSERT_CI241: Unaligned LPA - fast transfer assumes IU aligned transfers
+    ASSERT(0 == (sectorCount % INDIRECTION_GRANULARITY));                             /// ASSERT_CI242: Incorrect sectorCount - fast transfer assumes IU aligned transfers
+    ASSERT(RSP_NAND_HIT_MAX_IU_COUNT >= SECTORCOUNT2IUCOUNT(sectorCount));                 /// ASSERT_CI243: Incorrect sectorCount - fast transfer assumes IU aligned transfers
+
+    maxIu = 0;
+    lpa = startLpa;
+    sectorsRemaining = sectorCount;
+
+    // Locate each IU on Nand, and log RSP hit metrics information
+    while (sectorsRemaining)
+    {
+        // Get the physical band location from the indirection system
+        L2P_GetBandLocation(lpa, &bandLoc);      // This is a prefetch, that we'll use to check snap or QP dispatch
+
+        if (PLOC_IsInMedia(bandLoc))
+        {
+            nandAddr = L2P_GetNandAddressWithAdjustedSector(bandLoc, 0);
+
+            rspNandHitMetrics[maxIu].die    = NandAddr_GetDie(nandAddr);
+            rspNandHitMetrics[maxIu].baseEb = NandAddr_GetBaseEb(NandAddr_GetRawMultiLunLogicalEb(nandAddr));
+            rspNandHitMetrics[maxIu].page   = NandAddr_GetPage_hf(nandAddr);
+        }
+        else
+        {
+            // Zero content read, so mark die as NULL32
+            rspNandHitMetrics[maxIu].die = NULL32;
+        }
+
+        // Initialize IUs with default snap read enabled
+        iuSnapReadEnable[maxIu] = SNAP_READ_FORCED;
+
+        sectorsRemaining -= INDIRECTION_GRANULARITY;
+        lpa += INDIRECTION_GRANULARITY;
+        maxIu++;
+    }
+
+    // IUs on same die, base EB and page will be dispatched as QP/RSP. So, find them and mark them accordingly.
+    for (i = 0; i < maxIu; i++)
+    {
+        // Move to next IU if data not present in Nand
+        if ((NULL32 == rspNandHitMetrics[i].die))
+        {
+            iuDispatchOrder[iuIndex++] = i;
+            continue;
+        }
+
+        // Move to next IU if current IU is already marked to be issued as QP/RSP read
+        if(SNAP_READ_DISABLED == iuSnapReadEnable[i])
+        {
+            continue;
+        }
+
+        // This is the next IU during dispatch
+        iuDispatchOrder[iuIndex++] = i;
+
+        for (j = i + 1; j < maxIu; j++)
+        {
+            if ((rspNandHitMetrics[j].page ==  rspNandHitMetrics[i].page)
+                  && (rspNandHitMetrics[j].die ==  rspNandHitMetrics[i].die)
+                  && (rspNandHitMetrics[j].baseEb == rspNandHitMetrics[i].baseEb))
+            {
+                // RSP hit found, mark both IUs as 'snap read disabled' so we will issue QP/RSP read on these.
+                iuSnapReadEnable[i] = SNAP_READ_DISABLED;
+                iuSnapReadEnable[j] = SNAP_READ_DISABLED;
+                // Make IU at index 'j' the next IU for dispatch
+                iuDispatchOrder[iuIndex++] = j;
+            }
+        }
+    }
+    ASSERT(iuIndex == maxIu);   /// ASSERT_CI247: Not all IUs are encountered when re-ordering for dispatch
+}
+#pragma ghs CODESECTION_PERF_END
+#endif // ENABLE_IU_ALIGNED_READS
+
+#pragma ghs CODESECTION_PERF
+
+/**
+ * Dispatches nand or zero reads to fulfill host reads. Optimized to try to combine nand reads on the same
+ * pages into fewer requests.
+ * 
+ * This is an optimal work dispatcher for fast path read commands with ENABLE_PAGE_ALIGNED_READS true when
+ * the read request is exactly aligned (head and tail) to some multiple number of sequential IUs (likely
+ * not 4K or 8K).
+ * 
+ * This routine breaks up DMA descriptor(s) and dispatches associated NAND works based on the maximum
+ * number of IUs it can find in contiguous NAND space.
+ *
+ * @param   hostLpa         Starting LPA for host read.
+ * @param   sectorCount     Count of contiguous sectors to read, starting at hostLpa.
+ * @param   containerId     Work container to track dispatches with.
+ * @param   pCmd            Data cmd descriptor to setup DMA work.
+ * @param   sectorOffsetAdj Sector offset adjustment used by SAS code only.
+ *
+ * @note    differs from HostRead_SetupHostTransfer() in that can only dispatch max of 2 pages and it can't
+ *          handle read disturb collisions for spanning IUs. Read disturb collisions shouldn't happen in this
+ *          path because CalculateFirstIu() ensures at least 1 full IU is read, even if it causes 2 partial
+ *          page reads.
+ * @note    This routine is also geared to handle read commands which may have been preprocessed by read
+ *          prefetch (ie when read requests have been partially returned) by taking the pCmd LBA (originally
+ *          requested) into account, not just the passed hostLba, during DMA offset calculation.
+ */
+void HostRead_FastTransfer (const lba_t                 hostLpa,
+                            const uint32_t              sectorCount,
+                            const uint32_t              containerId,
+                            const dataCmdDesc_t        *pCmd,
+                            const uint32_t              sectorOffsetAdj)
+{
+#if ENABLE_PAGE_ALIGNED_READS
+    NandAddr_t          nandAddr[MAX_READ_PAGES];           // nand address for each page of nand read
+    LengthPageRead_t    pageLen[MAX_READ_PAGES];            // sectors to read for each page of nand read
+    lba_t               currLba;                            // usually current LPA to start each new nand read dispatch.  For IU spanning may get set to non-LPA value for final dispatch.
+    uint32_t            sectorsRemaining;                   // count of total remaining sectors to read for request
+    uint32_t            indCount;                           // count of sectors to read for current nand dispatch
+    uint32_t            bfridx;                             // transfer buffer sector index (start destination for nand read)
+    uint32_t            totalPages;                         // total number of pages in current nand dispatch (should always be <= MAX_READ_PAGES)
+    uint32_t            readDisturb = false;                // track whether read disturb is caused by this read
+ #if ENABLE_HITACHI_TRANSPORT
+    uint32_t            unaligned4kCount;
+ #endif // ENABLE_HITACHI_TRANSPORT
+    lba_t               cmdLba = DataCmdDesc_GetLba(pCmd);
+
+    ASSERT(IsLPA(hostLpa));                                 /// ASSERT_CI156: Unaligned LPA - fast transfer assumes IU aligned transfers
+    ASSERT(0 == (sectorCount % INDIRECTION_GRANULARITY));   /// ASSERT_CI157: Incorrect sectorCount - fast transfer assumes IU aligned transfers
+
+    CmdQ_HostRead_IncrementAllocated(sectorCount);
+    currLba = hostLpa;
+    sectorsRemaining = sectorCount;
+    
+    // Dispatch the Read
+    while (sectorsRemaining)
+    {
+        L2P_PreLoad(currLba);
+
+        if (gpActiveDma == NULL)
+        {
+            // Get and initialize a DMA descriptor
+            gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+            TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint32_t) (currLba - cmdLba), sectorOffsetAdj, containerId);
+        }
+
+        if (CollisionChecker_IsIuReserved(currLba))
+        {
+            WCM_HostReadCollisionPolicy(currLba, sectorsRemaining);
+        }
+
+        indCount = HostRead_SequentialSearch(currLba, MIN(sectorsRemaining, CMP_GetMaxReadBufferRequestSectors()), nandAddr, pageLen, &totalPages);
+        // Enable for extra debug
+        // NLog_Hfr_6("HostRead_FastTransfer: indCount %d currLBA 0x%lx pageOffset %d pageLen0 %d totalPages %d\n",
+        //             indCount, PARAM64(currLba), NandAddr_GetOffset(nandAddr[0]), pageLen[0], totalPages);
+
+        //Check if this LBA is on the media or if it is zero content
+#if ENABLE_TCG
+        // If Read Request to return zero return
+        if (0 == indCount || (pCmd->zeroFill))
+#else
+        if (0 == indCount)
+#endif // ENABLE_TCG
+        {
+            // zero content read
+            indCount = HostRead_Zero_SequentialSearch(currLba, sectorsRemaining);
+            bfridx   = GetGlobalZeroDataIdx();
+            SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)indCount, (uint16_t)NULL_RD_CS, false);
+            Work_Container_IncCount(containerId, indCount);
+        }
+        else
+        {
+            // nand read required
+            
+            // HostFast_DispatchNandReads() handles max of two pages.  If it's expanded to support more, need to adjust count passed into HostRead_SequentialSearch()
+            // or find another way truncate...or move to HostRead_DispatchNandReads() which can handle more.
+            ASSERT(totalPages <= 2); /// ASSERT_CI161: only supports up to 2 pages of reads
+            
+  #if ENABLE_HITACHI_TRANSPORT
+            unaligned4kCount = (indCount % 8);  // need to align to 4K (8 sectors)
+
+            if (unaligned4kCount > 0)
+            {
+                TruncateRead(unaligned4kCount, pageLen, &totalPages);
+                indCount -= unaligned4kCount;
+                // Enable for extra debug
+                // NLog_Hfr_6("HostRead_FastTransfer: currLBA 0x%lx pageOffset %d pageLen0 %d indCount %d totalPages %d truncated\n",
+                //            PARAM64(currLba), NandAddr_GetOffset(nandAddr[0]), pageLen[0], indCount, totalPages);
+            }
+  #endif // ENABLE_HITACHI_TRANSPORT
+
+            readDisturb = ReadDisturb_DoWeRelocate(NandAddr_GetEb(nandAddr[0]), NandAddr_GetDie(nandAddr[0]), currLba, totalPages);
+
+            bfridx = WCM_AllocateHostReadBuffer(indCount);
+            Work_Container_IncCount(containerId, indCount);
+
+            // Creating DmaBuffDesc and its corresponding NandWorkItem atomic.
+            SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)indCount, (uint16_t)NULL_RD_CS, false);
+
+            NLog_Hfr_8("HostRead_FastTransfer: currLBA 0x%x pageOffsets %d (%d) len %d (%d) indCount %d totalPages %d bfridx 0x%x\n",
+                       (uint32_t)currLba, NandAddr_GetOffset(nandAddr[0]), NandAddr_GetOffset(nandAddr[1]), pageLen[0], pageLen[1], indCount, totalPages, bfridx);
+
+            HostFast_DispatchNandReads(nandAddr, pageLen, totalPages, bfridx, (uint32_t)gpActiveDma, SNAP_READ_CONDITIONAL, /*isIuAligned*/ false);
+        }
+
+        // Update Tracking
+        currLba += indCount;
+        sectorsRemaining -= indCount;
+
+        if (sectorsRemaining == 0)
+        {
+  #if !(HOST_NVME)
+            gpActiveDma->Sector.last = true;
+  #endif // !(HOST_NVME)
+  #if ENABLE_HITACHI_TRANSPORT
+            // Mark this command as being fully dispatched, used as a deadlock
+            // prevention mechanism in the Hitachi transport
+            Trans_MarkAsDispatchComplete(pCmd);
+  #endif // ENABLE_HITACHI_TRANSPORT
+        }
+
+        // Dispatch the DMA descriptor
+        SendDmaDesc(pCmd);
+
+        // Only relocate the data after dispatching the DMA 
+        if (readDisturb)
+        {
+            // Since we've updated the LBA earlier, make sure to relocate the original
+            ReadDisturb_Relocate(NandAddr_GetEb(nandAddr[0]), (currLba - indCount));
+            readDisturb = false;
+        }
+    }
+#endif // ENABLE_PAGE_ALIGNED_READS
+}
+#pragma ghs CODESECTION_PERF_END
+
+#if ENABLE_IU_ALIGNED_READS
+#pragma ghs CODESECTION_PERF
+/**
+ * Dispatches nand or zero reads to fulfill host reads. Optimized to try to combine nand reads on the same
+ * pages into fewer snap read requests.
+ *
+ * This routine breaks up DMA descriptor(s) and dispatches associated NAND works based on the maximum
+ * number of IUs it can find in contiguous NAND space.
+ *
+ * @param   hostLpa         Starting LPA for host read.
+ * @param   sectorCount     Count of contiguous sectors to read, starting at hostLpa.
+ * @param   containerId     Work container to track dispatches with.
+ * @param   pCmd            Data cmd descriptor to setup DMA work.
+ */
+void HostRead_IuAlignedFastTransfer (const lba_t                 hostLpa,
+                                     const uint32_t              sectorCount,
+                                     const uint32_t              containerId,
+                                     const dataCmdDesc_t        *pCmd)
+{
+#if ENABLE_PAGE_ALIGNED_READS
+    NandAddr_t          nandAddr[MAX_READ_PAGES];           // nand address for each page of nand read
+    LengthPageRead_t    pageLen[MAX_READ_PAGES];            // sectors to read for each page of nand read
+    lba_t               currLba;                            // usually current LPA to start each new nand read dispatch.  For IU spanning may get set to non-LPA value for final dispatch.
+    uint32_t            sectorsRemaining;                   // count of total remaining sectors to read for request
+    uint32_t            indSectorCount;                     // count of sectors to read for current nand dispatch
+    uint32_t            bfridx;                             // transfer buffer sector index (start destination for nand read)
+    uint32_t            totalPages;                         // total number of pages in current nand dispatch (should always be <= MAX_READ_PAGES)
+    uint32_t            readDisturb = false;                // track whether read disturb is caused by this read
+    lba_t               cmdLba = DataCmdDesc_GetLba(pCmd);
+    uint32_t            rspIuHitIndex = 0;
+    ploc_t              bandLoc;
+    Length_t            iuLength;
+
+    ASSERT(IsLPA(hostLpa));                                 /// ASSERT_CI248: Unaligned LPA - fast transfer assumes IU aligned transfers
+    ASSERT(0 == (sectorCount % INDIRECTION_GRANULARITY));   /// ASSERT_CI249: Incorrect sectorCount - fast transfer assumes IU aligned transfers
+
+    // Calculate RSP hit metrics for each IU, and order IUs such that IUs on same page are dispatched in order.
+    RspHitMetricsCalculator(hostLpa, sectorCount);
+
+    CmdQ_HostRead_IncrementAllocated(sectorCount);
+    currLba = hostLpa;
+    sectorsRemaining = sectorCount;
+
+    indSectorCount = INDIRECTION_GRANULARITY; // Always just look at IU at a time.
+    totalPages = 1;
+    pageLen[0] = INDIRECTION_GRANULARITY;  // ONLY WORK WITH ALIGNED IND RIGHT NOW!
+    pageLen[1] = 0;
+
+    // Dispatch the Read
+    while (sectorsRemaining)
+    {
+        if (gpActiveDma == NULL)
+        {
+            // Get and initialize a DMA descriptor
+            gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+            TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint32_t) (currLba - cmdLba), 0, containerId);
+        }
+
+        if (CollisionChecker_IsIuReserved(currLba))
+        {
+            WCM_HostReadCollisionPolicy(currLba, sectorsRemaining);
+        }
+
+        L2P_GetBandLocation(currLba, &bandLoc);
+
+        // Enable for extra debug
+        // NLog_Hfr_6("HostRead_IuAlignedFastTransfer: indSectorCount %d currLBA 0x%lx pageOffset %d pageLen0 %d totalPages %d\n",
+        //             indSectorCount, PARAM64(currLba), NandAddr_GetOffset(nandAddr[0]), pageLen[0], totalPages);
+
+        //Check if this LBA is on the media or if it is zero content
+        if (false == PLOC_IsInMedia(bandLoc))
+        {
+            // zero content read
+            bfridx   = GetGlobalZeroDataIdx();
+            SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)indSectorCount, (uint16_t)NULL_RD_CS, false);
+            Work_Container_IncCount(containerId, indSectorCount);
+        }
+        else
+        {
+            iuLength.PageCount[0] = 0;
+            iuLength.PageCount[1] = 0;  // Initialize to prevent running into below assert.
+            // nand read required, must get a NAND address
+            L2P_GetNandAddress(bandLoc, nandAddr, &iuLength);
+            ASSERT(iuLength.PageCount[0] == INDIRECTION_GRANULARITY);   /// ASSERT_CI244: Incorrect sector count - ONLY WORK WITH ALIGNED IND RIGHT NOW!
+            ASSERT(iuLength.PageCount[1] == 0);                         /// ASSERT_CI245: Incorrect sector count - ONLY WORK WITH ALIGNED IND RIGHT NOW!
+
+            ASSERT(totalPages <= 1); /// ASSERT_CI250: only aligned IU reads, so IU should fit in a page
+
+            readDisturb = ReadDisturb_DoWeRelocate(NandAddr_GetEb(nandAddr[0]), NandAddr_GetDie(nandAddr[0]), currLba, totalPages);
+
+            bfridx = WCM_AllocateHostReadBuffer(indSectorCount);
+            Work_Container_IncCount(containerId, indSectorCount);
+
+            // Creating DmaBuffDesc and its corresponding NandWorkItem atomic.
+            SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)indSectorCount, (uint16_t)NULL_RD_CS, false);
+
+            NLog_Hfr_8("HostRead_IuAlignedFastTransfer: currLBA 0x%x pageOffsets %d (%d) len %d (%d) indSectorCount %d totalPages %d bfridx 0x%x\n",
+                       (uint32_t)currLba, NandAddr_GetOffset(nandAddr[0]), NandAddr_GetOffset(nandAddr[1]), pageLen[0], pageLen[1], indSectorCount, totalPages, bfridx);
+
+            HostFast_DispatchNandReads(nandAddr, pageLen, totalPages, bfridx, (uint32_t)gpActiveDma, iuSnapReadEnable[iuDispatchOrder[rspIuHitIndex]], /*isIuAligned*/ true);
+
+            if (readDisturb)
+            {
+                ReadDisturb_Relocate(NandAddr_GetEb(nandAddr[0]), currLba);
+            }
+        }
+
+        // Update Tracking
+        sectorsRemaining -= indSectorCount;
+        rspIuHitIndex++;
+        currLba = hostLpa + (iuDispatchOrder[rspIuHitIndex] * indSectorCount);
+
+        if (sectorsRemaining == 0)
+        {
+  #if !(HOST_NVME)
+            gpActiveDma->Sector.last = true;
+  #endif // !(HOST_NVME)
+        }
+
+        // Dispatch the DMA descriptor
+        SendDmaDesc(pCmd);
+    }
+
+#endif // ENABLE_PAGE_ALIGNED_READS
+}
+#pragma ghs CODESECTION_PERF_END
+#endif // ENABLE_IU_ALIGNED_READS
+
+#pragma ghs CODESECTION_PERF
+/**
+ * This is an optimal work dispatcher for fast path read commands with ENABLE_PAGE_ALIGNED_READS true when
+ * the read request is exactly aligned (head and tail) to an IU (4K). This routine sets up one DMA
+ * descriptor for the aligned read request, and dispatches the associated NAND work(s) skipping expensive
+ * range and NAND contiguity checking normally experienced in HostRead_FastTransfer().
+ *
+ * @param   hostLpa     Starting LBA of read request (guaranteed aligned to LPA)
+ * @param   containerId Work container to attach to transfers.
+ * @param   pCmd        Data cmd descriptor to provide details for DMA.
+ *
+ * @note    This routine is also geared to handle read commands which may have been preprocessed by read
+ *          prefetch (ie when read requests have been partially returned) by taking the pCmd LBA (originally
+ *          requested) into account, not just the passed hostLba, during DMA offset calculation.
+ * @note    see HostRead_FastTransfer() for generic version.
+ */
+void HostRead_Fast4kRead(const lba_t                 hostLpa,
+                         const uint32_t              containerId,
+                         const dataCmdDesc_t         *pCmd)
+{
+    uint32_t         bfridx;                                // transfer buffer sector index (start destination for nand read)
+    ploc_t           bandLocation;                          // physical location associated with currLba
+    NandAddr_t       nandAddr[MAX_PAGES_SPANNED_BY_LPA];    // nand address for each page of nand read.  Max of 2 entries to handle spanning IU
+    LengthPageRead_t pageLen[MAX_PAGES_SPANNED_BY_LPA];     // sectors to read for each page of nand read.  Max of 2 entries to handle spanning IU
+    Length_t         lpaSplit;                              // temporary value to hold sectors on each page for spanning IU
+    uint32_t         totalPages;                            // total number of pages in current nand dispatch.  Max of 2 to handle spanning IU
+    bool             readDisturb = false;                   // track whether read disturb is caused by this read
+    /// @todo needs rework for TLL.
+    uint32_t         beId = NULL_BE;                        // transfer buffer entry associated with fast 4K reads 
+    const uint32_t   sectorCount = HOST_READ_FAST4K_SECCOUNT;    // sectorCount is guaranteed by caller
+
+    lba_t            cmdLba = DataCmdDesc_GetLba(pCmd);
+
+    L2P_PreLoad(hostLpa);
+
+    // Get and initialize a DMA descriptor
+    gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+
+    TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint32_t) (hostLpa - cmdLba), 0, containerId);
+
+    if (CollisionChecker_IsIuReserved(hostLpa))
+    {
+        WCM_HostReadCollisionPolicy(hostLpa, DONT_REUSE_CACHESLOT);
+    }
+
+    CmdQ_HostRead_IncrementAllocated(sectorCount);
+    Work_Container_IncCount(containerId, sectorCount);
+
+    //Get the physical band location from the indirection system
+    L2P_GetBandLocation(hostLpa, &bandLocation);
+
+    //Check if this LBA is on the media or if it is zero content
+    if (PLOC_IsInMedia(bandLocation))
+    {
+        beId   = NULL_BE;
+        bfridx = WCM_AllocateHostReadBuffer(sectorCount);
+
+        //Initialize buffer descriptor for this DMA
+        // no sequential csid check
+        SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)sectorCount, (uint16_t)NULL_RD_CS, false);
+        CoreDmaPriv(gpActiveDma)->fast4kBeId = (uint16_t)beId;
+
+#if !(HOST_NVME)
+        gpActiveDma->Sector.last = true;
+#endif // !(HOST_NVME)
+
+        totalPages = L2P_GetNandAddress(bandLocation, nandAddr, &lpaSplit);
+
+        Band_IncrementReadCount(nandAddr[0]);
+        CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+
+        if (totalPages > 1)
+        // We may not need to submit the second read if all of the work was performed on the first page.
+        {
+            pageLen[0] = lpaSplit.PageCount[0];
+            pageLen[1] = lpaSplit.PageCount[1];
+
+            HostReadBufferFill(nandAddr[0], bfridx, pageLen[0], (uint32_t) gpActiveDma, SNAP_READ_CONDITIONAL);
+
+            // issue read for 2nd plane
+            Band_IncrementReadCount(nandAddr[1]);  //Still hits the same band, but will be processing 2 callbacks, one per die.
+            CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+
+            HostReadBufferFill(nandAddr[1], (bfridx + pageLen[0]), pageLen[1], (uint32_t)gpActiveDma, SNAP_READ_CONDITIONAL);
+
+            readDisturb = ReadDisturb_DoWeRelocate(PLOC2EB(bandLocation), PLOC2Die(bandLocation), hostLpa, 2);
+        }
+        else  // Only hits one plane.
+        {
+            HostReadBufferFill(nandAddr[0], bfridx, INDIRECTION_GRANULARITY, (uint32_t)gpActiveDma, SNAP_READ_CONDITIONAL);
+
+            readDisturb = ReadDisturb_DoWeRelocate(PLOC2EB(bandLocation), PLOC2Die(bandLocation), hostLpa, 1);
+        }
+    }
+    else
+    {
+        bfridx = GetGlobalZeroDataIdx();
+
+        // Initialize buffer descriptor for this DMA
+        SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)sectorCount, (uint16_t)NULL_RD_CS, false);
+
+#if !(HOST_NVME)
+        gpActiveDma->Sector.last = true;
+#endif // !(HOST_NVME)
+    }
+
+#if ENABLE_HITACHI_TRANSPORT
+    // Mark this command as being fully dispatched, used as a deadlock
+    // prevention mechanism in the Hitachi transport
+    Trans_MarkAsDispatchComplete(pCmd);
+#endif // ENABLE_HITACHI_TRANSPORT
+
+    // Send DMA to transport
+    SendDmaDesc(pCmd);
+
+    if (readDisturb)
+    {
+        ReadDisturb_Relocate(PLOC2EB(bandLocation), hostLpa);
+    }
+}
+#pragma ghs CODESECTION_PERF_END
+
+/**
+ * This is an optimal work dispatcher for fast path read commands with ENABLE_PAGE_ALIGNED_READS true when
+ * the read request is exactly aligned (head and tail) to two sequential IUs (8K).
+ * 
+ * If the entire read request exists in contiguous NAND space (ie on the same NAND page) this routine sets
+ * up one DMA descriptor for the aligned read request, and dispatches the associated NAND work(s) skipping
+ * expensive range and NAND contiguity checking normally experienced in HostRead_SetupHostTransfer().
+ * 
+ * If the entire read request does not exist in contiguous NAND space, then this routine will dispatch the
+ * NAND work by a call to HostRead_FastTransfer() which breaks up the work up into IU dispatches, or
+ * HostRead_SetupHostTransfer().
+ *
+ * @param   hostLpa     Starting LBA of read request (guaranteed aligned to LPA)
+ * @param   containerId Work container to attach to transfers.
+ * @param   pCmd        Data cmd descriptor to provide details for DMA.
+ *
+ * @note    This routine is also geared to handle read commands which may have been preprocessed by read
+ *          prefetch (ie when read requests have been partially returned) by taking the pCmd LBA (originally
+ *          requested) into account, not just the passed hostLba, during DMA offset calculation.
+ * @note    see HostRead_FastTransfer() for generic version.
+ */
+void HostRead_Fast8kRead(const lba_t                 hostLpa,
+                         const uint32_t              containerId,
+                         const dataCmdDesc_t         *pCmd)
+{
+    uint32_t         bfridx;                                // transfer buffer sector index (start destination for nand read)
+    uint32_t         indCount;                              // number of sectors that can be read sequentially
+    NandAddr_t       nandAddr[MAX_PAGES_SPANNED_BY_LPA];    // nand address for each page of nand read.  Max of 2 entries due to max of 2 IUs.
+    LengthPageRead_t pageLen[MAX_PAGES_SPANNED_BY_LPA];     // sectors to read for each page of nand read.  Max of 2 entries due to max of 2 IUs.
+    uint32_t         totalPages;                            // total number of pages in current nand dispatch.  Max of 2 due to max of 2 IUs.
+    const uint32_t   sectorCount = HOST_READ_FAST8K_SECCOUNT;
+    lba_t            cmdLba = DataCmdDesc_GetLba(pCmd);
+    snapReadEnable_e snapReadEnable = SNAP_READ_CONDITIONAL;
+
+    if (CollisionChecker_IsIuReserved(hostLpa))
+    {
+        WCM_HostReadCollisionPolicy(hostLpa, DONT_REUSE_CACHESLOT);
+    }
+
+    indCount = HostRead_SequentialSearch(hostLpa, sectorCount, nandAddr, pageLen, &totalPages);
+
+    if (indCount == sectorCount)
+    {
+        // The entire 8k is sequential on media.  Dispatch as a single DMA and make 8k buffer request.
+        
+        // Get and initialize a DMA descriptor
+        gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+        TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint32_t) (hostLpa - cmdLba), 0, containerId);
+
+        CmdQ_HostRead_IncrementAllocated(sectorCount);
+        Work_Container_IncCount(containerId, sectorCount);
+
+        bfridx = WCM_AllocateHostReadBuffer(sectorCount);
+
+        // Initialize buffer descriptor for this DMA.
+        SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)sectorCount, (uint16_t)NULL_RD_CS, false);
+
+#if !(HOST_NVME)
+        gpActiveDma->Sector.last = true;
+#endif // !(HOST_NVME)
+
+        Band_IncrementReadCount(nandAddr[0]);
+        CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+
+#if (!ENABLE_MULTIPLE_BE_RECURSION)
+        // do quad-plane read followed by read same page is more efficient than doing snap read followed by quad-plane read, so disabling snap read for small QDs
+        // for high QD 8kRR workloads, snap read trim overhead on the channel outweighs the gain on reduced NAND read latency
+
+        // For VSS projects, host read is likely to be translated into full-plane (DP/QP) read if it covers the last 6-sector codeword (with rotation). 
+        // RSP hit rate can be high even if the following chunk of read has small size (<= snap read size). 
+        // For non-VSS projects without write recursion, we may get similar performance gain due to the same reason. 
+        // But for non-VSS projects with write recursion, the chance to get RSP hit may be very low. 
+        // Therefore, making default switch for VSS projects.
+        // For non-VSS projects, we need more measurements to determine whether the additional RSP hit check is beneficial.
+        if ((totalPages > 1) && (pageLen[0] < SECTORS_PER_4KB))
+        {
+            snapReadEnable = SNAP_READ_DISABLED;
+        }
+#endif // (!ENABLE_MULTIPLE_BE_RECURSION)
+
+        // Dispatch first read.
+        HostReadBufferFill(nandAddr[0], bfridx, pageLen[0], (uint32_t) gpActiveDma, snapReadEnable);
+
+        // May not need to submit the second read if all of the work was performed on the first page.
+        if (totalPages > 1)
+        {
+            ASSERT(totalPages == 2);        /// ASSERT_CI174: HostRead_SequentialSearch should have calculated 2 pages to read
+
+            Band_IncrementReadCount(nandAddr[1]);
+            CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+
+            // Find the next buffer index
+            bfridx = WCM_WalkBuffer(bfridx, pageLen[0]);
+
+            // Dispatch second read.
+            HostReadBufferFill(nandAddr[1], bfridx, pageLen[1], (uint32_t) gpActiveDma, snapReadEnable);
+        }
+#if ENABLE_ASSERT
+        else
+        {
+            ASSERT(totalPages == 1);        /// ASSERT_CI175: HostRead_SequentialSearch should have calculated 1 page to read
+        }
+#endif // ENABLE_ASSERT
+
+#if ENABLE_HITACHI_TRANSPORT
+    // Mark this command as being fully dispatched, used as a deadlock
+    // prevention mechanism in the Hitachi transport
+    Trans_MarkAsDispatchComplete(pCmd);
+#endif // ENABLE_HITACHI_TRANSPORT
+
+        // Send DMA to transport.
+        SendDmaDesc(pCmd);
+
+        if (ReadDisturb_DoWeRelocate(NandAddr_GetEb(nandAddr[0]), NandAddr_GetDie(nandAddr[0]), hostLpa, totalPages))
+        {
+            ReadDisturb_Relocate(NandAddr_GetEb(nandAddr[0]), hostLpa);
+        }
+    }
+    else
+    {
+        // LBA is not on media or is not sequential
+        // caller already guaranteed request aligns to IUs, so fast transfer can be used
+        HostRead_FastTransfer(hostLpa, sectorCount, containerId, pCmd, 0);
+    }
+}
+
+#if ENABLE_READ_CACHE_HITS
+/**
+ * Check Cache for selected Host read.
+ *
+ * @param   hostLBA     LBA being read.
+ * @param   sectorCount total number of sectors being read.
+ * @param   startOff    offset within IU of the hostLBA; Gets Unaligned Portion.
+ *
+ * @return  returns true if the read is available in cache, and false otherwise.
+ *
+ * @note    This function is called from HostRead_AttemptCachedRead This function returns false either if
+ *          the IU associated with the given hostLBA isn't reserved or it's reserved but not in cache.
+ */
+bool HostRead_DoesCacheHaveHostRead(lba_t hostLBA, uint32_t sectorCount, uint32_t startOff)
+{
+    uint32_t idx;                              // host sectors per indirection unit index
+    uint32_t csId;                             // cache slot ID
+    const lba_t startLPA = LBA2LPA(hostLBA);   // the start LBA for associated IU
+
+    for (idx = 0; idx < (sectorCount + startOff); idx+=INDIRECTION_GRANULARITY) 
+    {
+        if (false == CollisionChecker_IsIuReserved(startLPA+idx))
+        {
+            // LBA is not in cache
+            return false;
+        }
+
+        // IU is reserved - try to find it in the cache
+        csId = WCM_CacheSlot_SearchHostQ(startLPA + idx);
+        if (csId == NULL_CS)
+        {
+            // Cache slot isn't on the host in use list, return false since
+            // the entire read can't be serviced from cache
+            return false;
+        }
+
+        rdCacheSlots[SECTORCOUNT2IUCOUNT(idx)] = csId;
+    }
+
+    return true;
+}
+
+/**
+ * Lock cache slots associated with this Host read.
+ *
+ * @param   hostLBA     LBA being read.
+ * @param   sectorCount total number of sectors being read.
+ * @param   startOff    offset within IU of the hostLBA; Gets Unaligned Portion.
+ *
+ * @note    This function is called from HostRead_AttemptCachedRead This function increments the read
+ *          reference count of the buffer entry and adds a log for the last cache slot accessed.
+ */
+void HostRead_LockCacheSlotsAssociatedWithHostRead(lba_t hostLBA, uint32_t sectorCount, uint32_t startOff)
+{
+    uint32_t idx;          // index of saved cache slot IDs
+
+    // Go through and lock all cacheslots associated with this read to prevent
+    // the cache slots from being freed during potential yields
+    for (idx = 0; idx <= SECTORCOUNT2IUCOUNT(sectorCount + startOff - 1); idx += 1)
+    {
+        WCM_CacheSlot_IncrementReferenceCount(rdCacheSlots[idx]);
+    }
+
+    NLog_Host_3("HostRead Cached Read: LBA 0x%lx, sectorCount %d\n", PARAM64(hostLBA),sectorCount);
+}
+
+/**
+ * Fills Cache slot with read if not dirty and not filled.
+ *
+ * @param   csId    cache slot ID.
+ * @param   bitMask bits are set for each sector in the cache slot associated with the Host read.
+ *
+ * @note    This function is called from HostRead_AttemptCachedRead This function checks the sectors in a
+ *          cache slot, for any sectors which are not dirty and have not been filled, it calls
+ *          WCM_ReadFillCacheSlot to issue a read fill.
+ */
+void HostRead_FillCacheSlotIfNeededForHostRead(uint32_t csId, uint32_t bitMask)
+{
+    // If the bits are not dirty or filled, we may need to issue a read fill to the cacheSlot.
+    if (((WCM_CacheSlot_GetDirty(csId) & bitMask) | (WCM_CacheSlot_GetFill(csId) & bitMask)) != bitMask)
+    {
+        // Only dispatch reads if the fill bits are NOT set.
+        WCM_ReadFillCacheSlot(csId);
+    }
+}
+
+/**
+ * Dispatches the DMA if read is done or DMA buffer count = 1.
+ *
+ * @param   sectorsRemaining    number of sectors that still need to be processed for the host read.
+ * @param   pCmd                a pointer to the core command descriptor associated with this read.
+ *
+ * @note    This function is called from HostRead_AttemptCachedRead This function checks to see if all
+ *          sectors have been processed and sets flags where needed This function sends the DMA descriptor to
+ *          the Transport when done.
+ */
+void HostRead_DispatchDmaIfDone(uint32_t sectorsRemaining, const dataCmdDesc_t *pCmd)
+{
+    if (sectorsRemaining == 0)
+    {
+#if !HOST_NVME
+        gpActiveDma->Sector.last = true;
+#endif // !HOST_NVME
+
+#if ENABLE_HITACHI_TRANSPORT
+        // Mark this command as being fully dispatched, used as a deadlock
+        // prevention mechanism in the Hitachi transport
+        Trans_MarkAsDispatchComplete(pCmd);
+#endif // ENABLE_HITACHI_TRANSPORT
+    }
+
+    if ((sectorsRemaining == 0) || (TransGetDmaBuffCountFromDmaDesc(gpActiveDma) == EMBEDDED_BUFF_DESCS_READ))
+    {
+        SendDmaDesc(pCmd);
+    }
+}
+
+/**
+ * Attempt to service this read from the write cache.
+ *
+ * @param   hostLBA     LBA being read.
+ * @param   sectorCount total number of sectors being read.
+ * @param   containerId the container to be used for this read command.
+ * @param   pCmd        a pointer to the core command descriptor associated with this read.
+ *
+ * @return  returns true if the read was successfully read from cache, and false otherwise.
+ *
+ * @note    This function is called from HostRead_Sectors before servicing any reads from Nand This
+ *          function returns false for either exceeding stripe size or starting LBA not found in Cache.
+ */
+bool HostRead_AttemptCachedRead(const lba_t hostLBA, const uint32_t sectorCount, const uint32_t containerId, const dataCmdDesc_t *pCmd)
+{
+    const uint32_t startOff = LBA2IUOFFSET(hostLBA);    // sector offset from Host LBA
+    uint32_t csArrayIdx;                                // array index for cache slots used in Host read
+    uint32_t csId;                                      // cache slot ID
+    lba_t currLBA;                                      // LBA from Host read that is currently being reviewed
+    uint32_t bfridx;                                    // buffer index
+    uint32_t lbaOffset;                                 // LBA offset within its IU; Unaligned Portion
+    uint32_t sectorsRemaining;                          // number of sectors that still need to be processed for the host read
+    uint32_t thisCount;                                 // total number of sectors used in the current cache slot
+    uint32_t bitMask;                                   // bits are set for each sector in the cache slot associated with the Host read
+
+    // First, determine if the entire read can be cached.  It does not provide benefit to have a partially cached read, and it adds much complexity.
+    // Stripe Size is set based on customer requirements. For Eg. EMC VNX System Stripe Size is 128 Sectors for SAS Interface
+    if ((sectorCount + startOff) > factoryConfig.rdCacheStripeSize)
+    {
+        return false;
+    }
+
+    // Second, determine if the read is in cache.
+    if (!HostRead_DoesCacheHaveHostRead(hostLBA, sectorCount, startOff))
+    {
+        return false;
+    }
+    else
+    {
+        HostRead_LockCacheSlotsAssociatedWithHostRead(hostLBA, sectorCount, startOff);
+    }
+
+    // We should be able to service this entire read from the write cache.  Setup DMA descriptors pointing to cache slots
+    sectorsRemaining = sectorCount;
+    currLBA = hostLBA;
+    csArrayIdx = 0;
+
+    while (sectorsRemaining)
+    {
+        csId      = rdCacheSlots[csArrayIdx];
+        ASSERT(csId < WCM_TOTAL_CACHESLOTS);                    /// ASSERT_CI144: Cache slot out of range
+        lbaOffset = LBA2IUOFFSET(currLBA);
+        bfridx    = WCM_WalkBuffer(WCM_CacheSlot_GetBuffer(csId), lbaOffset);
+        thisCount = MIN(sectorsRemaining, (INDIRECTION_GRANULARITY - lbaOffset));
+        bitMask   = MASK(thisCount) << lbaOffset;
+#if ENABLE_CS_REUSE_WITH_DELAYED_RMW
+        HostRead_FillCacheSlotIfNeededForHostRead(csId, bitMask);
+#endif //ENABLE_CS_REUSE_WITH_DELAYED_RMW
+        if (gpActiveDma == NULL)
+        {
+            //Get and initialize a DMA descriptor
+            gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+            TransIfc_FillDmaDesc(gpActiveDma, pCmd, (currLBA - DataCmdDesc_GetLba(pCmd)), 0, containerId);
+        }
+
+        // Initialize buffer descriptor for this DMA.
+        SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)thisCount, NULL_RD_CS, false);
+
+        //wait for the cacheslot to become valid
+        while ((WCM_GetValid(WCM_CacheSlot_GetBuffer(csId), INDIRECTION_GRANULARITY) & bitMask) != bitMask)
+        {
+            //Note - should not need to check for abort here.  if attempting to read from a cacheslot which is in-flight,
+            //that cache slot WILL eventually be made valid, either by RMW of the old data or converting it to pad and zero-filling
+            IdleTask_Yield();
+        }
+
+        NLog_Hfr_7("ReadCacheHit: CoreDesc 0x%x  DmaDesc 0x%x  CacheSlot %d BuffIdx 0x%x  LBA 0x%lx  sectorCount %d\n", (uint32_t)pCmd, (uint32_t)gpActiveDma, csId, bfridx, PARAM64(currLBA), thisCount);
+
+        Work_Container_IncCount(containerId, thisCount);
+
+        currLBA          += thisCount;
+        sectorsRemaining -= thisCount;
+        csArrayIdx++;
+
+        HostRead_DispatchDmaIfDone(sectorsRemaining, pCmd);
+    }
+
+    return true;
+}
+#else // ENABLE_READ_CACHE_HITS
+bool HostRead_AttemptCachedRead(const lba_t HostLBA, const uint32_t SectorCount,
+                                const uint32_t containerId, const dataCmdDesc_t *pCmd) { return false;}
+#endif // ENABLE_READ_CACHE_HITS
+
+/**
+ * Dispatches nand reads for sequential reads that may cover an entire page or more.
+ *
+ * @param   currLba         LBA associated with start of each dispatch.
+ * @param   cmdLba          LBA associated with start of host request.
+ * @param   pCmd            Data cmd descriptor provides details for setting up DMA.
+ * @param   sectorOffsetAdj Sector offset adjustment used by SAS code only.
+ * @param   containerId     Work container to track work.
+ * @param   nandAddr        Pointer to physical locations for each page of read.
+ * @param   pageLen         Pointer to length array for each page of read.
+ * @param   totalPages      Number of pages to read.
+ * @param   bfridx          transfer buffer sector index - starting destination for nand read.
+ */
+void HostRead_DispatchNandReads(lba_t                   currLba,
+                                const lba_t             cmdLba,
+                                const dataCmdDesc_t    *pCmd,
+                                const uint32_t          sectorOffsetAdj,
+                                const uint32_t          containerId,
+                                const NandAddr_t       *nandAddr,
+                                const LengthPageRead_t *pageLen,
+                                const uint32_t          totalPages,
+                                uint32_t                bfridx)
+{
+#if ENABLE_PAGE_ALIGNED_READS
+    uint8_t        worklen;
+    uint32_t       pageIndex = 0;
+    snapReadEnable_e snapReadEnable = SNAP_READ_CONDITIONAL;
+
+    // need to check both something to dispatch AND that total pages isn't too large (don't want to read garbage array entries)
+    ASSERT((totalPages >= 1) && (totalPages <= MAX_READ_PAGES));        /// ASSERT_CI201: page count must be within range
+
+    //====================================================================
+    // Dispatch the first (possibly partial) page at the start of the transfer
+    //====================================================================
+
+    worklen = pageLen[0];
+
+ #if ENABLE_DMA_DISPATCH_PER_NAND_WORK
+    // Need to set sector count on existing descriptor for first read.  Subsequent reads will grab a new descriptor
+    SetDmaBufferDescSectorCount(gpActiveDma, worklen);
+ #endif // ENABLE_DMA_DISPATCH_PER_NAND_WORK
+
+#if (!ENABLE_MULTIPLE_BE_RECURSION)
+    // do quad-plane read followed by read same page is more efficient than doing snap read followed by quad-plane read, so disabling snap read
+    if (totalPages > 1)
+    {
+        snapReadEnable = SNAP_READ_DISABLED;
+    }
+#endif // (!ENABLE_MULTIPLE_BE_RECURSION)
+
+    Band_IncrementReadCount(nandAddr[0]);
+    CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+    HostReadBufferFill(nandAddr[0], bfridx, worklen, (uint32_t) gpActiveDma, snapReadEnable);
+    
+    //===================================
+    // Now dispatch remaining reads (all aligned to start of page)
+    // Final read may have a length < size of page, but that's all managed in the pageLen[] passed in
+    //===================================
+    for (pageIndex=1; pageIndex < totalPages; pageIndex++)
+    {
+        currLba += worklen;
+        bfridx  = WCM_WalkBuffer(bfridx, worklen);
+        worklen = pageLen[pageIndex];
+
+ #if ENABLE_DMA_DISPATCH_PER_NAND_WORK
+        SendDmaDesc(pCmd);      // make sure active DMA is dispatched
+
+        CM_IncrementCsReferenceCountIfNecessary(bfridx);
+        
+        //Get and initialize a DMA descriptor
+        gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+        TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint32_t) (currLba - cmdLba - sectorOffsetAdj), sectorOffsetAdj, containerId);
+        SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)worklen, (uint16_t)NULL_RD_CS, false);
+
+ #endif // ENABLE_DMA_DISPATCH_PER_NAND_WORK
+
+        Band_IncrementReadCount(nandAddr[pageIndex]);
+        CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+        HostReadBufferFill(nandAddr[pageIndex], bfridx, worklen, (uint32_t) gpActiveDma, snapReadEnable);
+    }
+#endif  // ENABLE_PAGE_ALIGNED_READS
+}
+
+
+#pragma ghs CODESECTION_PERF
+/**
+ * Preps for and dispatches nand or zero read work to service a host read.
+ *
+ * @param   hostLBA     Starting LBA for host read.
+ * @param   sectorCount Count of contiguous sectors to read, starting at HostLBA.
+ * @param   pCmd        Data cmd descriptor provides details for setting up DMA.
+ * @param   containerId Container ID to track DMA and NAND work.
+ */
+void HostRead_Sectors(const lba_t         hostLBA,
+                      const uint32_t      sectorCount,
+                      const dataCmdDesc_t *pCmd,
+                      uint32_t            containerId)
+{
+    // Lock the work container while we add NAND and DMA work.
+    Work_Container_IncCount(containerId, 1);
+#if ENABLE_LOGGING_HOST
+    NLog_Fast_Host_5("HostRead_Sectors: pCmd 0x%x HLBA 0x%lx  Sectors %d DmaId %d\n", (uint32_t)pCmd, PARAM64(hostLBA), sectorCount, DataCmdDesc_GetDmaId(pCmd));
+#endif //ENABLE_LOGGING_HOST
+
+    if (factoryConfig.recursionDieWidth <= 1)
+    {
+        // Detect if reads are sequential. This is used in WCM to determine if the read is a snap read (random) or QP read (sequential)
+        SnapRead_CheckForSequentiality(hostLBA, sectorCount);
+    }
+    
+#if ENABLE_PAGE_ALIGNED_READS
+
+    if (false == HostRead_AttemptCachedRead(hostLBA, sectorCount, containerId, pCmd))
+    {
+ #if (!(RAMDISK_BUILD) && !(HAL_PLATFORM_VEP) && !(ENABLE_PAGE_SIZE_INDIRECTION))
+        if (IsLPA(sectorCount) && IsLPA(hostLBA))
+        {
+            // command is fully aligned to IUs - no sub-IU work needed
+            switch(sectorCount)
+            {
+                case HOST_READ_FAST4K_SECCOUNT:
+                    HostRead_Fast4kRead(hostLBA, containerId, pCmd);
+                    break;
+
+  #if ENABLE_HITACHI_TRANSPORT
+                case HOST_READ_FAST8K_SECCOUNT:
+                    HostRead_Fast8kRead(hostLBA, containerId, pCmd);
+                    break;
+  #endif // ENABLE_HITACHI_TRANSPORT
+
+                default:
+#if ENABLE_IU_ALIGNED_READS
+                    if (factoryConfig.recursionDieWidth > 1)
+                    {
+                        HostRead_IuAlignedFastTransfer(hostLBA, sectorCount, containerId, pCmd);
+                    }
+                    else
+                    {
+                        HostRead_FastTransfer(hostLBA, sectorCount, containerId, pCmd, 0);
+                    }
+#else // ENABLE_IU_ALGNED_READS
+                    HostRead_FastTransfer(hostLBA, sectorCount, containerId, pCmd, 0);
+#endif // ENABLE_IU_ALIGNED_READS
+            }
+        }
+        else
+ #endif // (!(RAMDISK_BUILD) && !(HAL_PLATFORM_VEP) && !(ENABLE_PAGE_SIZE_INDIRECTION))
+        {
+            HostRead_SetupHostTransfer(DataCmdDesc_GetLba(pCmd), hostLBA, sectorCount, containerId, pCmd, 0, IS_LAST_CMD_SEGMENT, HOST_READ_DMA_XFER_PAIR_DEFAULT);
+        }
+    }
+
+#else  // ENABLE_PAGE_ALIGNED_READS
+ #if ENABLE_4K_HOT_PATH
+    if ( IsLPA(hostLBA) && (sectorCount == HOST_READ_FAST4K_SECCOUNT) )
+    {
+        // command is fully aligned to IUs - no sub-IU work needed
+        HostRead_Fast4kRead_Sata(hostLBA, containerId, pCmd);
+    }
+    else
+ #endif // ENABLE_4K_HOT_PATH
+    {
+        HostRead_SetupHostTransferSata( hostLBA, sectorCount, pCmd, containerId);
+    }
+#endif  // ENABLE_PAGE_ALIGNED_READS
+
+    Work_Container_SetDone_hf(containerId);
+
+    // See if we're done already with the transaction.
+    // (Could occur here if we blocked somewhere after the last NAND read and
+    //  finished the transaction already)
+    if (Work_Container_DecCount(containerId, 1))
+    {
+        CallBack_ContainerfptrArray[Work_Container_GetCallback(containerId)](containerId);
+    }
+}
+#pragma ghs CODESECTION_PERF_END
+
+/**
+ * Determine the host transfer length considering possible start LBA unaligned to IU.
+ * 
+ * Returned length should ensure either that request is entirely satisfied or next work will align to IU.
+ * Use this function in conjunction with GetStartAlignedWorkLenIuGran()
+ *
+ * @param   startLba    Starting LPA for request.
+ * @param   sectorCount Total sector count for request.
+ *
+ * @return  Size of initial work (in sectors)
+ */
+INLINE_PERF uint32_t GetUnalignedWorkLenIuGran(lba_t startLba, uint32_t sectorCount)
+{
+    uint32_t iuOffset = LBA2IUOFFSET(startLba);
+    lba_t startLpa = LBA2LPA(startLba);
+    // If an LBA starts on a page boundary and sectorCount = 1, endPage = next page LBA
+    lba_t endLpa   = LBA2LPA_ROUNDUP(startLba + sectorCount);
+    uint32_t worklen;
+
+    if ((endLpa - startLpa) > INDIRECTION_GRANULARITY)
+    {
+        // work spans this IU, truncate worklen to ensure next aligns to start of IU
+        worklen = (INDIRECTION_GRANULARITY - iuOffset);
+    }
+    else
+    {
+        // entire request fits in IU
+        worklen = sectorCount;
+    }
+
+    ASSERT(worklen <= INDIRECTION_GRANULARITY);     /// ASSERT_CI164: worklen too large
+
+    return worklen;
+}
+
+/**
+ * Determine the next host transfer length.
+ *
+ * @param   startLpa    Current start lpa of request.  Increases by IU as request is processed.
+ * @param   endLba      Final lba of request.  Fixed for entire request.
+ *
+ * @return  Size of next work (in sectors)
+ *
+ * @note    The final transfer of the request may not align to IU - will truncate to sectorsInFinalCount.
+ */
+INLINE_PERF uint32_t GetStartAlignedWorkLenIuGran(lba_t startLpa, lba_t endLba)
+{
+    uint32_t worklen;
+    uint32_t sectorsRemaining = (uint32_t) (endLba - startLpa);
+
+    ASSERT(IsLPA(startLpa));                /// ASSERT_CI165: Expected startLpa to align to IU
+
+    if (sectorsRemaining >= INDIRECTION_GRANULARITY)
+    {
+        // work remaining fully populates an IU (either not final transfer, or final aligns to IU)
+        worklen = INDIRECTION_GRANULARITY;
+    }
+    else
+    {
+        // final transfer doesn't align to an IU boundary, truncate worklen
+        worklen = LBA2IUOFFSET(endLba);
+    }
+
+    return worklen;
+}
+
+/**
+ * Is this LBA in the last IU to be requested?
+ *
+ * @param   currLba LBA to check.
+ * @param   endLpa  LPA occurring JUST AFTER last IU to be requested.
+ *
+ * @return  True if currLba is last IU to be requested, False otherwise.
+ *
+ * @note    Used for non-page aligned read paths that issue single IU reads.
+ */
+inline bool IsLastIuTransfer(const lba_t currLba, const lba_t endLpa)
+{
+    if ((currLba + INDIRECTION_GRANULARITY) >= endLpa)
+    {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Get transfer buffer index assigned for zero data.
+ *
+ * @return  buffer index.
+ */
+inline uint32_t GetGlobalZeroDataIdx(void)
+{
+    return gZeroDataIdx;
+}
+
+/**
+ * Set transfer buffer index for zero data.
+ *
+ * @param   value   buffer index associated with zero data.
+ */
+inline void SetGlobalZeroDataIdx(uint32_t value)
+{
+    gZeroDataIdx = value;
+}
+
+/**
+ * Get total number of verify error entries.
+ *
+ * @return  total number of verify error entries.
+ */
+inline uint32_t GetVerifyErrorEntriesCount(void)
+{
+    return array_dim(gVerifyError.errorLbaBitMask);
+}
+
+/**
+ * Get verify error entry.
+ *
+ * @param   index   index into verify error entries.
+ *
+ * @return  bit mask associated with entry.
+ */
+inline uint32_t GetVerifyErrorEntryMask(uint32_t index)
+{
+    return gVerifyError.errorLbaBitMask[index];
+}
+
+/**
+ * Is cmd associated with verify error a read verify cmd?
+ *
+ * @return  True if cmd was read verify, false otherwise.
+ */
+inline bool IsVerifyErrorCmdReadVerify(void)
+{
+    return (bool)(gVerifyError.isCmdReadVerify);
+}
+
+#pragma ghs section text = ".text_dram"
+
+
+void HostRead_InitializeErrorBitArray(uint32_t readVerify)
+{
+    uint32_t i;
+
+    if (!readVerify)
+    {
+        for (i = 0; i < ERROR_WORD_ARRAY_SIZE; i++)
+        {
+            gVerifyError.errorLbaBitMask[i] = 0;
+        }
+    }
+
+    gVerifyError.isCmdReadVerify = readVerify;
+}
+
+/**
+ * Preps for and dispatches nand or zero read work to service a host read.
+ *
+ * @param   cmd         core cmd type for read.
+ * @param   hostLBA     Starting LBA for host read.
+ * @param   sectorCount Count of contiguous sectors to read, starting at hostLBA.
+ * @param   pCmd        Data cmd descriptor provides details for setting up DMA.
+ */
+void HostRead_SectorsNonPerf(const coreDataCmd_e  cmd,
+                             const lba_t          hostLBA,
+                             const uint32_t       sectorCount,
+                             const dataCmdDesc_t *pCmd)
+{
+    unsigned        containerId;
+    lba_t           currLpa;
+    unsigned        worklen;
+    const lba_t     startLpa = LBA2LPA(hostLBA);
+    const lba_t     endLba   = (hostLBA + sectorCount);
+    // If an LBA starts on a page boundary and sectorCount = 1, endPage = next page LBA
+    const lba_t     endLpa   = LBA2LPA_ROUNDUP(hostLBA + sectorCount);
+
+    void (*pReadSetupFunction)(const lba_t,
+                               const uint32_t,
+                               const uint32_t,
+                               const dataCmdDesc_t *,
+                               const bool);
+
+    pReadSetupFunction = &HostRead_SetupVerify; // Setup the call back function now , we will have a valid function if the command type check below fails.
+
+    // Set up the work container, which tracks the read as a whole
+    containerId = Work_Container_GetEntry();
+
+    switch (cmd)
+    {
+        case CORE_DATA_CMD_READ_VERIFY:
+#if HOST_SATA
+            pReadSetupFunction = &HostRead_SetupVerify;
+            Work_Container_SetCallback(containerId, CallBack_Container_HostRead);
+            Work_Container_SetCallBackContext( containerId, DataCmdDesc_StorePtr(pCmd));
+            Work_Container_SetCallBackContext2(containerId, CORE_DATA_CMD_STATUS_SUCCESS);
+#endif //HOST_SATA
+            break;
+
+#if HOST_NVME
+        case CORE_DATA_CMD_COMPARE:
+            // set up for Compare
+            pReadSetupFunction = &HostRead_SetupCompareChunk;
+
+            Work_Container_SetCallback(containerId, CallBack_Container_HostRead);
+            Work_Container_SetCallBackContext(containerId, DataCmdDesc_StorePtr(pCmd));
+            Work_Container_SetCallBackContext2(containerId, CORE_DATA_CMD_STATUS_SUCCESS);
+            break;
+#endif // HOST_NVME
+
+        default:
+            ASSERT_ENTERPRISE(0);  /// ASSERT_CI084: HostRead_SectorsNonPerf: Unknown command type
+
+    }
+
+    Work_Container_IncCount(containerId, 1);
+
+    // Determine the first host transfer length, considering possible page misaligned starting LBA.
+    worklen = GetUnalignedWorkLenIuGran(hostLBA, sectorCount);
+
+    pReadSetupFunction(hostLBA,
+                       worklen,
+                       containerId,
+                       pCmd,
+                       (bool)((hostLBA + INDIRECTION_GRANULARITY) >= endLpa));
+
+    for (currLpa = (startLpa + INDIRECTION_GRANULARITY); currLpa < endLpa; currLpa += INDIRECTION_GRANULARITY)
+    {
+        worklen = GetStartAlignedWorkLenIuGran(currLpa, endLba);
+
+        pReadSetupFunction(currLpa,
+                           worklen,
+                           containerId,
+                           pCmd,
+                           (bool)((currLpa + INDIRECTION_GRANULARITY) >= endLpa));
+    }
+
+    Work_Container_SetDone(containerId);
+
+    //
+    // See if we're done already with the transaction.
+    // (Could occur here if we just did a read verify to a location not on NAND, or
+    //  we blocked somewhere after the last NAND read and finished the transaction already)
+    //
+    if (Work_Container_DecCount(containerId, 1))
+    {
+        CallBack_ContainerfptrArray[Work_Container_GetCallback(containerId)](containerId);
+    }
+}
+
+#pragma ghs section text = default
+
+/**
+ * DMA descriptor is completely filled out, send it off for processing.
+ *
+ * @param   pCmd    Data cmd descriptor.
+ *
+ * @note    gpActiveDma gets reset back to NULL in the function.
+ */
+INLINE_HF void SendDmaDesc(const dataCmdDesc_t *pCmd)
+{
+    CoreDmaPriv(gpActiveDma)->SchedulingDone = true;
+
+    if (CoreDmaPriv(gpActiveDma)->FillOpsLeft == 0)
+    {
+        //
+        // Send the descriptor to the Transport - this only happens if the descriptor
+        // was all zero-read (no fill operation required)
+        //
+
+        TransIfc_PostDma(gpActiveDma, pCmd);
+    }
+
+#if (HOST_NVME && ENABLE_PLI_INJECT)
+    PliInject_AccessCheck(PINJ_ACCESS_XFER_STARTED);
+#endif // (HOST_NVME && ENABLE_PLI_INJECT)
+
+    // This will ensure if the helper is called again, a new descriptor is allocated
+    gpActiveDma = NULL;
+}
+
+//
+// If the Merge size is too large, then QD1 large reads suffer.
+// Testing has shown that 32 is optimal. Must be < 256
+//
+
+/**
+ * This routine sets up a DMA descriptor for the input read parameters specified, determines if the read
+ * request is on NAND, and dispatches the NAND work via an API to fulfill the read request if necessary.
+ *
+ * @param   hostLba         LBA to start reading from.
+ * @param   sectorCount     Number of sectors to read.
+ * @param   cmdContainerId  Container ID.
+ * @param   pCmd            iCmd pointer.
+ * @param   last            Last read for this command?
+ * @param   sectorOffsetAdj Sector offset adjustment.
+ *
+ * @note    This routine is currently only used for ENABLE_PAGE_ALIGNED_READS == false builds.
+ * @note    This routine is also geared to handle read commands which may have been preprocessed by read
+ *          prefetch (ie when read requests have been partially returned) by taking the pCmd LBA (originally
+ *          requested) into account, not just the passed hostLba, during DMA offset calculation.
+ * @note    NSGSE-29978: Not used in the code path figure out why and update for betarock.
+ */
+void HostRead_SetupHostDma(const lba_t                 hostLba,
+                           const uint32_t              sectorCount,
+                           const uint32_t              cmdContainerId,
+                           const dataCmdDesc_t        *pCmd,
+                           const bool                  last,
+                           const uint32_t              sectorOffsetAdj)
+{
+    uint16_t           bfridx;
+    uint32_t           totalPages;
+    lba_t              LPA = LBA2LPA(hostLba);
+    ploc_t             ploc;
+    NandAddr_t         nandAddr[MAX_PAGES_SPANNED_BY_LPA];  // nand address for IU (may be multiple for VSS)
+    Length_t           lpaSplit;                            // number of sectors for IU on each page
+    bool               indirectionUnitOnNand = false;
+    bool               readDisturb = false;
+    lba_t              cmdLba = DataCmdDesc_GetLba(pCmd);
+    bool               hostUsingMoreThanMaxAllowed;
+
+    ASSERT(hostLba < INTERNAL_LBA_BASE);        /// ASSERT_CI069: Host LBA out of range
+
+    if (InitState_IsLogicalEnabled())
+    {
+        if(CollisionChecker_IsIuReserved(LPA))
+        {
+            WCM_HostReadCollisionPolicy(LPA, DONT_REUSE_CACHESLOT);
+        }
+
+        // Perform indirection lookup to get band/offset location
+        L2P_GetBandLocation(LPA, &ploc);
+        indirectionUnitOnNand = PLOC_IsInMedia(ploc);
+    }
+
+    if (NULL != gpActiveDma)
+    {
+        if (false == indirectionUnitOnNand)
+        {
+            // Send out any prior DMA descriptor, which will cause a new allocation for the
+            // DMA descriptor with no indirection unit on NAND. The Taylorsville LSI FW
+            // has restrictions that force us to have a new DMA descriptor for every
+            // 'NULL' buffer descriptor (fake buffer indicating no indirection unit on NAND)
+            SendDmaDesc(pCmd);
+        }
+        else if (GetDmaBufferDescBufferIndex(gpActiveDma) & READ_ZERO_FILL_FLAG_MASK)
+        {
+            SendDmaDesc(pCmd);
+        }
+    }
+
+    if (NULL == gpActiveDma)
+    {
+        // Get and initialize a DMA descriptor
+        gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+        TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint32_t) (hostLba - cmdLba - sectorOffsetAdj), sectorOffsetAdj, cmdContainerId);
+    }
+
+    if (indirectionUnitOnNand)
+    {
+        totalPages = L2P_GetNandAddressToLbaOffset(ploc, &nandAddr[0], &lpaSplit, LBA2IUOFFSET(hostLba));
+        // We have to increment the read count before grabbing buffer because we
+        // can potentially yield out and erase this block.
+        Band_IncrementReadCount(nandAddr[0]);
+        bfridx = (uint16_t)WCM_AllocateHostReadBuffer(sectorCount);
+
+        HostReadBufferFill(nandAddr[0],
+                bfridx,
+                sectorCount,
+                (uint32_t) gpActiveDma,
+                SNAP_READ_CONDITIONAL);
+
+        CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+
+        readDisturb = ReadDisturb_DoWeRelocate(NandAddr_GetEb(nandAddr[0]), NandAddr_GetDie(nandAddr[0]), hostLba, totalPages);
+    }
+    else
+    {
+        //
+        // We have space reserved in the TxBuf SRAM for zero data
+        // the index is available in GetGlobalZeroDataIdx()
+        // We set bit 15 of the Buffer index high to indicate to the transport that
+        // the descriptor is for a zero fill operation
+        //
+        bfridx = (uint16_t)GetGlobalZeroDataIdx();
+        ASSERT(sectorCount <= GetReadZeroDataBuffSizeSectors());  /// ASSERT_CI024: (auto) DMA issue mailbox full
+    }
+
+    //Initialize buffer descriptor for this DMA
+    SetAndAttachDmaBufferDesc(gpActiveDma, bfridx, (uint8_t)sectorCount, NULL_RD_CS, false);
+
+    CmdQ_HostRead_IncrementAllocated(sectorCount);
+    Work_Container_IncCount(cmdContainerId, sectorCount);
+
+    hostUsingMoreThanMaxAllowed = WCM_IsHostUsingMoreThanAllowedRead(INDIRECTION_GRANULARITY);
+    // See if this DMA descriptor must go out
+    if (last ||
+            gpActiveDma->Sector.bufferCount >= EMBEDDED_BUFF_DESCS ||
+            // This check makes sure our next allocation won't cause us to block and leave the
+            // DMA descriptor unsent to the Transport.
+            hostUsingMoreThanMaxAllowed ||
+            readDisturb)
+    {
+        if (last)
+        {
+#if !(HOST_NVME)
+            gpActiveDma->Sector.last = true;
+#endif // !(HOST_NVME)
+#if ENABLE_HITACHI_TRANSPORT
+            Trans_MarkAsDispatchComplete(pCmd);
+#endif // ENABLE_HITACHI_TRANSPORT
+        }
+
+        SendDmaDesc(pCmd);
+
+        if (readDisturb)
+        {
+            ReadDisturb_Relocate(NandAddr_GetEb(nandAddr[0]), hostLba);
+        }
+    }
+}
+#pragma ghs CODESECTION_PERF_END
+
+#if ENABLE_4K_HOT_PATH
+#pragma ghs CODESECTION_PERF
+/**
+ * This is an optimal work dispatcher for fast path read commands with ENABLE_PAGE_ALIGNED_READS false when
+ * the read request is exactly aligned (head and tail) to an IU (4K). This routine sets up one DMA
+ * descriptor for the aligned read request, and dispatches the associated NAND work(s) skipping expensive
+ * range and NAND contiguity checking normally experienced in HostRead_FastTransfer().
+ *
+ * @param   hostLpa     Starting LBA of read request (guaranteed aligned to LPA)
+ * @param   containerId Work container to attach to transfers.
+ * @param   pCmd        Data cmd descriptor to provide details for DMA.
+ *
+ */
+void HostRead_Fast4kRead_Sata(const lba_t                 hostLpa,
+                              const uint32_t              containerId,
+                              const dataCmdDesc_t         *pCmd)
+{
+#if !ENABLE_PAGE_ALIGNED_READS
+    uint32_t         bfridx;                                // transfer buffer sector index (start destination for nand read)
+    ploc_t           bandLocation;                          // physical location associated with currLba
+    NandAddr_t       nandAddr[MAX_PAGES_SPANNED_BY_LPA];    // nand address for each page of nand read.  Max of 2 entries to handle spanning IU
+    Length_t         lpaSplit;                              // temporary value to hold sectors on each page for spanning IU
+    bool             readDisturb = false;                   // track whether read disturb is caused by this read
+    uint32_t         beId = NULL_BE;                        // transfer buffer entry associated with fast 4K reads 
+    const uint32_t   sectorCount = HOST_READ_FAST4K_SECCOUNT;    // sectorCount is guaranteed by caller
+
+    lba_t            cmdLba = DataCmdDesc_GetLba(pCmd);
+
+    // Get and initialize a DMA descriptor
+    gpActiveDma = TransIfc_GetDmaDesc(pCmd);
+    TransIfc_FillDmaDesc(gpActiveDma, pCmd, (uint16_t) (hostLpa - cmdLba), 0, (uint16_t)containerId);
+
+    if (CollisionChecker_IsIuReserved(hostLpa))
+    {
+        WCM_HostReadCollisionPolicy(hostLpa, DONT_REUSE_CACHESLOT);
+    }
+    CmdQ_HostRead_IncrementAllocated(sectorCount);
+    Work_Container_IncCount(containerId, sectorCount);
+
+    //Get the physical band location from the indirection system
+    L2P_GetBandLocation(hostLpa, &bandLocation);
+
+    //Check if this LBA is on the media or if it is zero content
+    if (PLOC_IsInMedia(bandLocation))
+    {
+        beId   = NULL_BE;
+        bfridx = WCM_AllocateHostReadBuffer(sectorCount);
+
+        //Initialize buffer descriptor for this DMA
+        // no sequential csid check
+        SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)sectorCount, (uint16_t)NULL_RD_CS, false);
+        CoreDmaPriv(gpActiveDma)->fast4kBeId = (uint16_t)beId;
+
+        gpActiveDma->Sector.last = true;
+
+        L2P_GetNandAddress(bandLocation, nandAddr, &lpaSplit);
+        Band_IncrementReadCount(nandAddr[0]);
+        CoreDmaPriv(gpActiveDma)->FillOpsLeft++;
+        HostReadBufferFill(nandAddr[0], bfridx, INDIRECTION_GRANULARITY, (uint32_t)gpActiveDma, SNAP_READ_CONDITIONAL);
+        readDisturb = ReadDisturb_DoWeRelocate(PLOC2EB(bandLocation), PLOC2Die(bandLocation), hostLpa, 1);
+    }
+    else
+    {
+        //
+        // We have space reserved in the TxBuf SRAM for zero data
+        // the index is available in GetGlobalZeroDataIdx()
+        // We set bit 15 of the Buffer index high to indicate to the transport that
+        // the descriptor is for a zero fill operation
+        //
+        bfridx = (uint16_t)GetGlobalZeroDataIdx();
+        ASSERT(sectorCount <= GetReadZeroDataBuffSizeSectors());  /// ASSERT_CI256: sector count too large
+        //Initialize buffer descriptor for this DMA
+        SetAndAttachDmaBufferDesc(gpActiveDma, (uint16_t)bfridx, (uint8_t)sectorCount, (uint16_t)NULL_RD_CS, false);
+        gpActiveDma->Sector.last = true;
+    }
+    // Send DMA to transport
+    SendDmaDesc(pCmd);
+
+    if (readDisturb)
+    {
+        ReadDisturb_Relocate(PLOC2EB(bandLocation), hostLpa);
+    }
+#endif //!ENABLE_PAGE_ALIGNED_READS
+}
+#pragma ghs CODESECTION_PERF_END
+#endif // ENABLE_4K_HOT_PATH
+
+#pragma ghs CODESECTION_PERF
+
+/**
+ * Generic read dispatcher, less optimized but can handle any read.
+ * 
+ * This is the "generic" work dispatcher for fast path read commands with ENABLE_PAGE_ALIGNED_READS false.
+ *
+ * @param   hostLBA     Starting LBA for host read.
+ * @param   sectorCount Count of contiguous sectors to read, starting at HostLBA.
+ * @param   pCmd        Data cmd descriptor provides details for setting up DMA.
+ * @param   containerId Container ID to track DMA and NAND work.
+ *
+ */
+void HostRead_SetupHostTransferSata(const lba_t         hostLBA,
+                                    const uint32_t      sectorCount,
+                                    const dataCmdDesc_t *pCmd,
+                                    uint32_t            containerId)
+{
+#if !ENABLE_PAGE_ALIGNED_READS
+    const lba_t startLpa = LBA2LPA(hostLBA);
+    const lba_t endLba   = (hostLBA + sectorCount);
+    // If an LBA starts on a page boundary and sectorCount = 1, endPage = next page LBA
+    const lba_t endLpa   = LBA2LPA_ROUNDUP(endLba);
+    lba_t       currLpa;
+    uint32_t    worklen;
+
+    // Determine the first host transfer length, considering possible page misaligned starting LBA.
+    worklen = GetUnalignedWorkLenIuGran(hostLBA, sectorCount);
+
+#if (CF == CF_PAINTEDROCK) 
+    // In the PR HAL a read descriptor is given priority over a simultaneous write descriptor.                                                             
+    // So for any read command, we need to check if the LBA range is locked by writes. For Example a read command has two LBA ranges                     
+    //  LBA Range A which do not overlap with any writes and LBA Range B which has a overlap with current write command. DMA Descriptor for LBA Range A          
+    // is submitted to SDL (HAL) and it can proceed simultaneous write DMA descriptors. In that case, The Read command cant finish as core did not 
+    // send descriptor for LBA range B.  Core cant send DMA descriptor as LBA range B has locked LBAs. Locked LBAs are never unlocked as write (that locked them) 
+    // did not finish. Hence a dead lock. So the entire region of a read needs to be checked for collision.
+    // TODO: IsLogicalEnabled is done twice for each LPA, once here and once in HostRead_SetupHostDma, see if you can takeout one
+    if (InitState_IsLogicalEnabled())
+    {
+        for(currLpa = startLpa; currLpa < endLpa; currLpa += INDIRECTION_GRANULARITY)
+        {
+            if(CollisionChecker_IsIuReserved(currLpa))
+            {
+                WCM_HostReadCollisionPolicy(currLpa, DONT_REUSE_CACHESLOT);
+            }
+        }
+    }
+#endif // (CF == CF_PAINTEDROCK)
+
+    // First Read
+    HostRead_SetupHostDma(hostLBA,  // currLBA == HostLBA to start with.
+            worklen,
+            containerId,
+            pCmd,
+            IsLastIuTransfer(hostLBA, endLpa),
+            0);
+
+    for (currLpa = (startLpa + INDIRECTION_GRANULARITY); currLpa < endLpa; currLpa += INDIRECTION_GRANULARITY)
+    {
+        worklen = GetStartAlignedWorkLenIuGran(currLpa, endLba);
+
+        HostRead_SetupHostDma(currLpa,
+                worklen,
+                containerId,
+                pCmd,
+                IsLastIuTransfer(currLpa, endLpa),
+                0);
+    }
+#endif //!ENABLE_PAGE_ALIGNED_READS
+}
+#pragma ghs CODESECTION_PERF_END
+
+/**
+ * This function tracks and frees read buffer if not cached for read. If cached for Read, flags the
+ * readcacheCounters to allow cached read or CS reuse.
+ *
+ * @param   pDma    Transfer DMA descriptor associated with the read cmd.
+ * @param   index   index of the transfer buffer within the DMA descriptor buffer array.
+ */
+uint32_t HostRead_BufferXferDone(transDmaDesc_t *pDma, unsigned index)
+{
+    const uint32_t bufferIndex   = TransGetBufferIndexFromDmaDesc(pDma, index);
+    const uint32_t sectorCount   = TransGetSectorCountFromDmaDesc(pDma, index);
+
+#if (!(HOST_SAS) || ENABLE_CTL)
+    if ((bufferIndex & READ_ZERO_FILL_FLAG_MASK) != READ_ZERO_FILL_FLAG_MASK)
+    {
+        CM_FreeHostReadBuffer(bufferIndex, sectorCount);
+    }
+
+    // Zero Fill reads cause allocations but not "ready for Xport"
+#if (CF == CF_PAINTEDROCK)
+    if(!(bufferIndex & READ_ZERO_FILL_FLAG_MASK))
+#endif // (CF == CF_PAINTEDROCK)
+    {
+        CmdQ_HostRead_DecrementReadyForXport(sectorCount);
+    }
+#if (CF == CF_PAINTEDROCK)
+    else
+    {
+        CmdQ_HostRead_DecrementAllocated(sectorCount);
+    }
+#endif // (CF == CF_PAINTEDROCK)
+#endif
+
+    return sectorCount;
+}
+
+#pragma ghs CODESECTION_PERF_END
+
+#if !ENABLE_CMI_READ_PATH
+REGISTER_CALLBACK(CallBack_Container_HostRead, HostRead_ContainerCallback);
+#endif // !ENABLE_CMI_READ_PATH
+
+#pragma ghs CODESECTION_PERF
+/**
+ * Invoked when all data for a Transport read command has gone to the host.
+ */
+void HostRead_ContainerCallback(uint32_t containerID)
+{
+    dataCmdDesc_t *pCmd;
+
+    pCmd = DataCmdDesc_GetPtr(Work_Container_GetCallBackContext(containerID));
+
+#if !(HOST_NVME) && !(CF_ABERDEENROCK)
+    // Tell the Transport that the command is complete
+    ASSERT(!CoreDataComplMb_Full());                /// ASSERT_CI025: Core Data completion mailbox full
+#endif // !(HOST_NVME) && !(CF_ABERDEENROCK)
+
+    TransIfc_PostDataCmdCompletion(pCmd);
+
+#if ENABLE_PLI_INJECT
+    PliInject_AccessCheck(PINJ_ACCESS_XFER_DONE);
+#endif // ENABLE_PLI_INJECT
+    Work_Container_PutEntry(containerID);
+    CmdQ_DataCmdDone(pCmd, true);
+
+#if ENABLE_SLOW_PATH_CORE_DISPATCH
+    if (pCmd->Priority == CORE_PRI_NORMAL)
+    {
+        CmdQ_CtrlCmdDone((coreCtrlCmdDesc_t *)pCmd->transPriv.pCoreCtrlPtr, STATUS_COMPLETE_OK);
+    }
+#endif // ENABLE_SLOW_PATH_CORE_DISPATCH
+}
+#pragma ghs CODESECTION_PERF_END
+
+#if !ENABLE_CMI_READ_PATH
+/**
+ * Returns the first LBA associated with the given work item.
+ * 
+ * Calculate "how far" the buffer pointer associated with work is from the base of DMA corresponding, and
+ * then figure out offset from the base lba corresponding to original cmd Non-trivial!!
+ * 
+ * If the transport architecture changes, this code potentially has to change. A potential
+ * alternative would be to use work item's callback context to store compressed LBA (you won't all 32bits
+ * because its already in use), but this adds overhead to each read - something we want to avoid.
+ *
+ * @param   nandWorkId  NAND Work Item in question.
+ */
+lba_t HostRead_GetExpectedStartLBA (uint32_t nandWorkId)
+{
+    transDmaDesc_t     *pDma;
+    dataCmdDesc_t      *pCmd;
+    lba_t               calculatedLBA, lba;
+    uint32_t            bufOfsWorkItem, ofs;
+    uint32_t            secOfs;
+
+#if ENABLE_CRC_STOMP_DEBUG
+    lba_t bufferLBA;
+    static uint32_t workCallbackCount = 0;
+#endif // ENABLE_CRC_STOMP_DEBUG
+
+    ofs = 0;
+
+    // Figure out which DMA index does this work item belong to
+    pDma = (transDmaDesc_t *) Nand_Work_GetCallbackContext(nandWorkId);
+    // Get the Command to get the base lba associated with this transfer
+    // Restore core data command descriptor from containerId.
+    pCmd = DataCmdDesc_GetPtr(pDma->Sector.coreCmdPtr);
+   
+#if HOST_NVME    
+    ASSERT(CmdQ_GetCmdState(pCmd) != CMD_STATE_NOT_IN_USE);  /// ASSERT_CI238: Cannot use a freed pCmd to calculate the lba.
+#endif //HOST_NVME    
+    lba = DataCmdDesc_GetLba(pCmd);
+    // What sector offset does this command descriptor represent?
+    secOfs = pDma->Sector.sectorOffset;
+
+    // Get buffer offset from NAND work
+    bufOfsWorkItem = Nand_Work_GetBufferPtrA_hf(nandWorkId);
+
+    // Now figure out the offset into the host read dma
+    ofs = HostRead_GetBufferOffset(pDma, bufOfsWorkItem);
+
+    // Done! lba corresponding to this work item is given by adding base lba
+    // of the entire command with length of sectors between
+    // base lba and the sector length upto the work item buffer
+    calculatedLBA = lba + secOfs + ofs;
+
+
+#if ENABLE_CRC_STOMP_DEBUG
+    // Get the lba for debug purposes
+    bufferLBA = Tbuf_GetBufferLBA(Nand_Work_GetBufferPtrA_hf(nandWorkId));
+
+    ASSERT(bufferLBA==calculatedLBA); /// ASSERT_CI080: Calculated and actual LBAs don't match!
+    workCallbackCount++;
+#endif // ENABLE_CRC_STOMP_DEBUG
+
+    return (calculatedLBA);
+}
+
+/**
+ * Searches for a particular buffer offset inside a DMA descriptor command.
+ *
+ * @param   pDma                Pointer to the read DMA in question.
+ * @param   workBufferOffset    buffer offset we are looking for.
+ *
+ * @return  The offset found.
+ *
+ * @note    With TLL, the buffer is discontinuous, so the entire command needs to be walked until the
+ *          offset into the read dma is found.
+ * @note    With Legacy, each individual DMA is continuous, so check each DMA to see if it contains the
+ *          buffer offset we are looking for.
+ */
+uint32_t HostRead_GetBufferOffset(const transDmaDesc_t *pDma, uint32_t workBufferOffset)
+{
+    uint32_t bufferDescriptorIndex;
+    uint32_t lbaOffset;
+    uint32_t searchOffset;
+    uint32_t sectorCount;
+    const uint32_t bufferCount = TransGetDmaBuffCountFromDmaDesc(pDma);
+
+    uint32_t searchCacheSlot;       // current cache slot to search
+    uint32_t workingCacheSlot;      // cache slot being search for
+    
+    lbaOffset = 0;
+
+    // Calculate the cacheslot that we are searching for
+    workingCacheSlot = WCM_GetCacheSlotFromBufferIndex(workBufferOffset);
+
+    // With TLL we have to walk cacheslots in different way
+    // Since we have only have a buffer offset to work with, we don't know which DMA this cacheslot is associated with
+    // So we have to walk through each DMA checking each cacheslot until we find the appropriate one.
+    // walk through max DMA index associated with this command
+    for (bufferDescriptorIndex = 0; bufferDescriptorIndex < bufferCount; bufferDescriptorIndex++)
+    {
+        searchOffset = TransGetBufferIndexFromDmaDesc(pDma, bufferDescriptorIndex);
+        sectorCount = TransGetSectorCountFromDmaDesc(pDma, bufferDescriptorIndex);
+
+        // Check for zero fill first. If a sector is zerofill, it is definitely not the one we are looking for
+        if (!(searchOffset & READ_ZERO_FILL_FLAG_MASK))
+        {
+            searchCacheSlot = WCM_GetCacheSlotFromBufferIndex(searchOffset);
+
+            // And check if any of the cacheslots associated with this DMA are the cacheslot we are looking for
+            while ((workingCacheSlot != searchCacheSlot) && (sectorCount > INDIRECTION_GRANULARITY))
+            {
+                // Increase the lbaOffset
+                lbaOffset += INDIRECTION_GRANULARITY;
+
+                // Now find the next cacheslot and adjust the sector count
+                searchCacheSlot = WCM_CacheSlot_GetNextInBuffer(searchCacheSlot);
+                searchOffset = WCM_CacheSlot_GetBuffer(searchCacheSlot);
+                sectorCount -= INDIRECTION_GRANULARITY;
+            }
+
+            // Check if we found the cacheslot we are looking for
+            if (workingCacheSlot == searchCacheSlot)
+            {
+                break;
+            }
+        }
+
+        lbaOffset += sectorCount;
+    }
+
+    // buffer offset found
+
+    ASSERT(bufferDescriptorIndex != bufferCount); /// ASSERT_CI079: HostRead_GetBufferOffset(): Cannot find buffer associated with work item in any DMA buffers
+    ASSERT((workBufferOffset - searchOffset) < INDIRECTION_GRANULARITY); /// ASSERT_CI264: Buffer calculation breaks IU boundaries
+    // now, find out "how far" the work item's buffer is from the base of the corresponding DMA buffer
+    lbaOffset += (workBufferOffset - searchOffset);
+
+#if ENABLE_HITACHI_TRANSPORT
+    lbaOffset += TransDmaPriv(pDma)->SectorOffsetAdj;
+#endif // ENABLE_HITACHI_TRANSPORT
+
+    return lbaOffset;
+}
+#endif // !ENABLE_CMI_READ_PATH
+
+#if ENABLE_RECOV_ERR_INJECT
+/**
+ * Returns the Cmd tag associated with the given work item.
+ * 
+ * In the case of a slow-path read operation, cmdTag correlates to the slow-path message block slot number
+ * In the case of a fast-path read, it will set to iCmd index of the fast-path read operation The most-
+ * significant-bit of this field indicate �TagIsIcmdIndex" 0xFFFF Indicating that command is not
+ * associated with a host read operation.
+ *
+ * @param   nandWorkId  NAND Work Item in question.
+ */
+uint32_t HostRead_GetCmdTag (uint32_t dmaDescAddr)
+{
+    transDmaDesc_t *pDma;
+    dataCmdDesc_t  *pCmd;
+    unsigned       cmdTag;
+
+    pDma = (transDmaDesc_t *) dmaDescAddr;
+
+    pCmd = DataCmdDesc_GetPtr(pDma->Sector.coreCmdPtr);
+
+    if (pCmd->Priority == CORE_PRI_NORMAL)
+    {
+        cmdTag = TransDataCmdPriv(pCmd)->Tag;
+    }
+    else
+    {
+        cmdTag = TransDataCmdPriv(pCmd)->bits.cdBufOffset | ICMD_TAG_FLAG;
+    }
+
+    return (cmdTag);
+}
+#endif // ENABLE_RECOV_ERR_INJECT
+
+#if !ENABLE_CMI_READ_PATH
+REGISTER_CALLBACK(CallBack_NAND_Work_HostRead, HostRead_NandWorkCallback);
+#endif // !ENABLE_CMI_READ_PATH
+
+#pragma ghs CODESECTION_PERF
+/**
+ * Invoked when a single NAND work item is complete.
+ *
+ * @param workID The nand work item identifier for the completed read.
+ */
+void HostRead_NandWorkCallback(uint32_t workID)
+{
+#if !ENABLE_CMI_READ_PATH
+    transDmaDesc_t *pDma = (transDmaDesc_t *)Nand_Work_GetCallbackContext(workID);
+    uint32_t sectors = Nand_Work_GetTotalCount(workID);
+    uint32_t bufferIndex = Nand_Work_GetBufferPtrA_hf(workID);
+    NandAddr_t nandAddr = Nand_Work_GetAddressA_hf(workID);
+
+    WCM_VerifyReadLba(workID);
+
+    ReadCallback(bufferIndex, sectors, nandAddr, pDma);
+
+    Nand_Work_PutEntry(workID);
+#endif // !ENABLE_CMI_READ_PATH
+}
+#pragma ghs CODESECTION_PERF_END
+
+#if ENABLE_CMI_READ_PATH
+#pragma ghs CODESECTION_PERF
+/**
+ * CMI Read callback to complete fast path read command.
+ *
+ * @param header Pointer to CMI message header.
+ * @param context Contextual data for the CMI message.
+ */
+void HostRead_CmiCallback(cmiMsgHeader_t *header, contextData_t *context)
+{
+    cmiReadMessage_t *readMessage;
+
+    readMessage = CMI_Downstream_GetReadMessageHandle(header);
+    ASSERT(readMessage != NULL); /// ASSERT_CI282: Unable to get read message handle for CMI message header
+
+    ReadCallback(
+            readMessage->bufferOffset, 
+            readMessage->numberOfSectors, 
+            readMessage->physicalAddress,
+            (transDmaDesc_t *) (CoreMediaIfc_GetData32(context)));
+
+    CoreMediaIfc_ClearCmiContextInformation(header->msgid);
+}
+#pragma ghs CODESECTION_PERF_END
+#endif // ENABLE_CMI_READ_PATH
+
+/**
+ * Common callback to complete fast path read commands.
+ *
+ * @param   bufferIndex Transfer buffer destination for data.
+ * @param   sectors     Number of sectors read.
+ * @param   nandAddr    Nand address the read targeted.
+ * @param   pDma        Pointer to the DMA descriptor.
+ */
+INLINE_PERF void ReadCallback(uint32_t bufferIndex, uint32_t sectors, NandAddr_t nandAddr, transDmaDesc_t *pDma)
+{
+    dataCmdDesc_t  *pCmd;
+#if ENABLE_SCAN_TBUF_FOR_UNC_BEFORE_DMA
+    transBufferDesc_t *pBD = GetDmaBufferDesc(pDma); // 1st tbuf entry of descriptor;
+    tbufLba_t errorLba;
+#endif // ENABLE_SCAN_TBUF_FOR_UNC_BEFORE_DMA
+
+    // Update WCM valid table
+    WCM_SetValid_hf(bufferIndex, sectors);
+
+    CoreDmaPriv(pDma)->FillOpsLeft--;
+
+#if (HOST_NVME && ENABLE_ERROR_INJECTION)
+    // Protection Information Error Injection
+    if (IsPiErrorInjectionEnabled())
+    {
+        uint32_t piField;
+        tbufLba_t bufferLBA;
+
+        // get buffer offset from NAND work
+        bufferLBA = Tbuf_GetBufferLBA(bufferIndex);
+        if (bufferLBA == GetPiErrorCorruptLba())
+        {
+            piField = Tbuf_GetBufferPI(bufferIndex);
+            NLog_Host_3("LBA to be corrupted 0x%lx, Protection Information 0x%x\n", PARAM64(bufferLBA), piField);
+            piField = ~piField;
+            Tbuf_SetBufferPI(bufferIndex,piField);
+        }
+    }
+#endif // (HOST_NVME && ENABLE_ERROR_INJECTION)
+
+#if ENABLE_SCAN_TBUF_FOR_UNC_BEFORE_DMA
+    if((bufferIndex == pBD->BufferIndex) && HostRead_TbufContainsUncErrors(bufferIndex, &errorLba)) // Check for 1st sector of 1st buffer index. Only scan that sector.
+    {
+        pDma->Sector.errorLbaHigh = LbaUtil_LbaHigh((lba_t)errorLba);
+        pDma->Sector.errorLbaLow = LbaUtil_LbaLow((lba_t)errorLba);
+        pDma->Sector.uncDetected = 1;
+        // restore core data command descriptor from containerId.
+        pCmd = DataCmdDesc_GetPtr(pDma->Sector.coreCmdPtr);
+        pCmd->Error = true;
+    }
+#endif // ENABLE_SCAN_TBUF_FOR_UNC_BEFORE_DMA
+
+    // See if this DMA descriptor is ready to go out
+    if ((CoreDmaPriv(pDma)->FillOpsLeft == 0) &&
+        (CoreDmaPriv(pDma)->SchedulingDone))
+    {
+        // restore core data command descriptor from containerId.
+        pCmd = DataCmdDesc_GetPtr(pDma->Sector.coreCmdPtr);
+
+        // Send the descriptor to the Transport
+#if (ENABLE_CTL || HOST_SATA)
+        TransIfc_PostDma(pDma, pCmd);
+#else // (ENABLE_CTL || HOST_SATA)
+        TransDmaIssueMb_Notify(DataCmdDesc_GetDmaId(pCmd), pDma, (bool)pCmd->common.Bypassed);
+#endif // (ENABLE_CTL || HOST_SATA)
+    }
+
+    CmdQ_HostRead_IncrementReadyForXport(sectors);
+
+    Band_DecrementReadCount(nandAddr);
+}
+
+#pragma ghs section text = ".text_dram"
+
+/**
+ * Initialize the SRAM data buffer reserved for zero data and the associated buffer index.
+ *
+ * @param allocReserveBuf flag to request buffer allocation
+ */
+void CoreIfc_InitZeroDataBuffer(bool allocReserveBuf)
+{
+#if (ENABLE_HMI_TOKEN_0)
+
+    uint16_t    bfridx;
+
+    if (allocReserveBuf)
+    {
+        bfridx = (uint16_t)WCM_AllocateReservePageBuffer(PAGE_ENTRY_ZERO_FILL);  // Take a reserve buffer and never free it.
+    }
+    else
+    {
+        bfridx = (uint16_t)WCM_GetZeroDataBufferIdx();
+    }
+
+ #if ENABLE_HMI_TOKEN_0
+    if(Krnl_MediaBankIsMaster())
+    {
+        ASSERT_ENTERPRISE(bfridx == TOKEN_0_TBUF_OFFSET); /// ASSERT_CI220: Start offset has to be 0 = TOKEN_0_TBUF_OFFSET which is hard coded in N/S shared header file
+    }
+ #endif // ENABLE_HMI_TOKEN_0
+    if (allocReserveBuf)
+    {
+        WCM_LockReservePageBuffer(bfridx);  // Lock the buffer, so it will never be freed.
+        WCM_SetZeroDataBufferIdx(bfridx);
+    }
+
+    // Write out the reserved TBuf space
+ #if ENABLE_HMI_TOKEN_0
+    Tbuf_ZeroFillBufferSectors(bfridx, GetReadZeroDataBuffSizeSectors(), LBA_TOKEN_ZERO_FILL, false, false);
+ #else // ENABLE_HMI_TOKEN_0
+    Tbuf_ClearBufferSectors(bfridx, GetReadZeroDataBuffSizeSectors());
+ #endif // ENABLE_HMI_TOKEN_0
+
+    // Set Bit 15 of the Index to indicate that this is a zero fill operation
+    SetGlobalZeroDataIdx(READ_ZERO_FILL_FLAG_MASK | bfridx);
+
+#endif // (ENABLE_HMI_TOKEN_0)
+}
+
+/**
+ * Initialize the SRAM data buffer reserved for zero data and the associated buffer index.
+ *
+ * @param dramAddr   shared dram address
+ * @param size       amount of data to copy in bytes
+ */
+void CoreIfc_SetZeroDataBufferToValue(uint32_t dramAddr, uint32_t size)
+{
+#if ENABLE_HMI_TOKEN_0
+
+    uint16_t    bfridx = (uint16_t)(GetGlobalZeroDataIdx() & ~READ_ZERO_FILL_FLAG_MASK);
+    uint32_t    *pDramAddr = (uint32_t *)dramAddr;
+
+    ASSERT_ENTERPRISE(bfridx <= Tbuf_GetTotalSectorsPossible()); /// ASSERT_CI202: gZeroDataIdx must be initialized.
+
+    WCM_SetZeroDataBufferIdx(bfridx);
+
+    HalCpu_InvalidateDataCacheAddress(dramAddr, dramAddr + size);
+
+    Tbuf_SetBufferSectorsNoMeta((uint32_t)bfridx, 1, pDramAddr);
+
+    // Set Bit 15 of the Index to indicate that this is a fill operation
+    SetGlobalZeroDataIdx(READ_ZERO_FILL_FLAG_MASK | bfridx);
+
+#endif // ENABLE_HMI_TOKEN_0
+}
+
+inline uint32_t GetReadZeroDataBuffSizeSectors(void)
+{
+    return (WCM_PAGES_PER_RESV_BE * CoreConfig_GetConfiguredSectorsPerPage());
+}
+
+/**
+ * Is protection information error injection enabled?
+ *
+ * @return  True if enabled, false otherwise.
+ */
+inline bool IsPiErrorInjectionEnabled(void)
+{
+#if (HOST_NVME && ENABLE_ERROR_INJECTION)
+    return (bool)(piData.injectionState);
+#else  // (HOST_NVME && ENABLE_ERROR_INJECTION)
+    return false;
+#endif // (HOST_NVME && ENABLE_ERROR_INJECTION)
+}
+
+/**
+ * LBA to corrupt associated with protection information error.
+ *
+ * @return  LBA to corrupt.
+ */
+inline lba_t GetPiErrorCorruptLba(void)
+{
+#if (HOST_NVME && ENABLE_ERROR_INJECTION)
+    return piData.corruptLba;
+#else  // (HOST_NVME && ENABLE_ERROR_INJECTION)
+    return NULL_LBA;
+#endif // (HOST_NVME && ENABLE_ERROR_INJECTION)
+}
+
+/**
+ * Set the error injection PI data.
+ *
+ * @param   injectionState  1 to enable injection, 0 to disable.
+ * @param   corruptLba      LBA to corrupt.
+ */
+void CmdQ_SetPiData(uint32_t injectionState, lba_t corruptLba)
+{
+#if (HOST_NVME && ENABLE_ERROR_INJECTION)
+    piData.injectionState = (bool)injectionState;
+    piData.corruptLba  = corruptLba;
+#endif // (HOST_NVME && ENABLE_ERROR_INJECTION)
+}
+
+
+
+
+#pragma ghs CODESECTION_PERF
+/**
+ * Issues reads to populate transfer buffer from media (fast path version).
+ *
+ * Keep this fast, please do not bloat. Bloat slow path version if needed.
+ *
+ * @param   nandAddr        Nand address source for data.
+ * @param   bufferIndex     Transfer buffer destination for data.
+ * @param   sectorCount     Number of sectors to fill.
+ * @param   callbackContext Contextual data for the nand work call back (e.g., DMA descriptor pointer).
+ * @param   snapReadEnable  Force, disable or conditionally enable snap reads.
+ */
+INLINE_PERF void HostReadBufferFill(const NandAddr_t       nandAddr,
+                                    const uint32_t         bufferIndex,
+                                    const uint32_t         sectorCount,
+                                    const uint32_t         callbackContext,
+                                    const snapReadEnable_e snapReadEnable)
+{
+#if ENABLE_CMI_READ_PATH
+
+    cmiReadMessage_t *readMessage;
+
+    CMI_Downstream_AllocateReadMessage(&readMessage);
+
+    readMessage->physicalAddress       = nandAddr;
+    readMessage->bufferOffset          = (uint16_t)bufferIndex;
+    readMessage->numberOfSectors       = (uint16_t)sectorCount;
+
+    if (SnapRead_Policy(nandAddr, sectorCount, snapReadEnable)) 
+    { 
+        Stats_Inc_SnapReads(); 
+        readMessage->flags.allowSnapRead = true;
+    } 
+
+    CoreMediaIfc_SetCmiContextInformation(readMessage->header.msgid, &HostRead_CmiCallback, callbackContext, NULL_CONTAINER);
+
+    CMI_Downstream_SendReadMessage(CMI_READ_MB_0, readMessage);
+    
+#else // ENABLE_CMI_READ_PATH
+
+    WCM_NandFillTransferBuffer_hf(nandAddr,
+            bufferIndex,
+            sectorCount,
+            CallBack_NAND_Work_HostRead,
+            callbackContext,
+            snapReadEnable);
+
+#endif // ENABLE_CMI_READ_PATH
+}
+#pragma ghs CODESECTION_PERF_END
+
+/**
+ * Issues reads to populate transfer buffer from media (slow path version).
+ *
+ * @param   nandAddr        Nand address source for data.
+ * @param   bufferIndex     Transfer buffer destination for data.
+ * @param   sectorCount     Number of sectors to fill.
+ * @param   reason          The reason we are calling the slow fill.
+ * @param   lba             The lba or token attached to the slow fill.
+ * @param   containerId     Container id associated with read command.
+ */
+INLINE_PERF void HostReadSlowBufferFill(const NandAddr_t       nandAddr,
+                                        const uint32_t         bufferIndex,
+                                        const uint32_t         sectorCount,
+                                        const slowFillReason_e reason, 
+                                        const lba_t            lba,
+                                        const uint32_t         containerId)
+{
+#if ENABLE_CMI_READ_PATH
+
+    cmiCallback_t callbackFn = NULL;
+    cmiReadMessage_t *readMessage;
+
+    CMI_Downstream_AllocateReadMessage(&readMessage);
+
+    readMessage->physicalAddress       = nandAddr;
+    readMessage->bufferOffset          = (uint16_t)bufferIndex;
+    readMessage->numberOfSectors       = (uint16_t)sectorCount;
+    readMessage->flags.allowSnapRead   = false;
+
+    switch (reason)
+    {
+        case HOST_READ_COMPARE:
+            callbackFn = &HostRead_CompareCmiCallback;
+            break;
+        case HOST_READ_VERIFY:
+            callbackFn = &HostRead_VerifyCmiCallback;
+            break;
+        case HOST_READ_SELF_TEST_VERIFY:
+            callbackFn = &HostRead_VerifyCmiCallback;
+            break;
+        default:
+            ASSERT(0); /// ASSERT_CI283: Invalid reason given for performing slow fill.
+            break;
+    }
+
+    CoreMediaIfc_SetCmiContextInformation(readMessage->header.msgid, callbackFn, lba, containerId);
+
+    CMI_Downstream_SendReadMessage(CMI_READ_MB_0, readMessage);
+#else // ENABLE_CMI_READ_PATH
+
+    NANDCallBack_e callback;
+    uint32_t nandWid = Nand_Work_GetEntry();
+
+    switch (reason)
+    {
+        case HOST_READ_COMPARE:
+            callback = CallBack_NAND_Work_HostReadCompare;
+            break;
+        case HOST_READ_VERIFY:
+            callback = CallBack_NAND_Work_HostRead_Verify;
+            break;
+        case HOST_READ_SELF_TEST_VERIFY:
+            callback = CallBack_NAND_Work_DstRead_Verify;
+            break;
+        default:
+            ASSERT(0); /// ASSERT_CI284: Invalid reason given for performing slow fill.
+            callback = CallBack_NAND_Work_Simple;
+            break;
+    }
+
+    WCM_NandFillSlowPathDispatchWork(
+            nandWid,
+            nandAddr,
+            bufferIndex,
+            sectorCount,
+            callback,
+            lba,
+            containerId);
+
+#endif // ENABLE_CMI_READ_PATH
+}
+
+#if ENABLE_CMI_READ_PATH
+#pragma ghs CODESECTION_PERF
+/**
+ * Process a host read CMI completion.
+ *
+ * @param header Pointer to CMI message header.
+ * @param context Contextual data for the CMI message.
+ */
+void HostRead_ProcessCompletion(cmiMsgHeader_t *header, contextData_t *context)
+{
+    cmiCallback_t callbackFn;
+
+    if (context != NULL)
+    {
+        callbackFn = CoreMediaIfc_GetCallabackFn(context);
+
+        if (callbackFn != NULL)
+        {
+            callbackFn(header, context);
+        }
+        else
+        {
+            ASSERT(0); /// ASSERT_CI286: Missing callback for host read message completion.
+        }
+    }
+    else
+    {
+        ASSERT(0); /// Missing context data for host read message completion.
+    }
+}
+#pragma ghs CODESECTION_PERF_END
+#endif // ENABLE_CMI_READ_PATH
+
+/** @} */
